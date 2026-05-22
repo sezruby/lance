@@ -3665,6 +3665,7 @@ dependencies = [
  "log",
  "moka",
  "object_store",
+ "parquet",
  "permutation",
  "pin-project",
  "prost",

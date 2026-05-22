@@ -1911,7 +1911,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     column: &str,
     index_name: &str,
     index_id: Uuid,
-    mut ivf: IvfModel,
+    ivf: IvfModel,
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
@@ -1920,13 +1920,48 @@ pub async fn write_ivf_pq_file_from_existing_index(
         .indices_dir()
         .join(index_id.to_string())
         .join("index.idx");
-    let mut writer = obj_store.create(&path).await?;
+    write_ivf_pq_file_external(
+        obj_store,
+        &path,
+        column,
+        index_name,
+        dataset.version().version,
+        ivf,
+        pq,
+        streams,
+    )
+    .await
+}
+
+/// Write an IVF-PQ index file directly to an `(ObjectStore, Path)` pair, with no
+/// `Dataset` dependency. Used by the external IVF-PQ builder
+/// ([`crate::index::vector::external::ExternalIvfPqIndex::build`]) — the build
+/// inputs (vectors + rids) come from caller-supplied parquet files, not a Lance
+/// dataset, so there's no manifest to read a version off and no `indices_dir` to
+/// derive a path from.
+///
+/// `dataset_version` is recorded in the index file's protobuf metadata. For
+/// external indices it can be `0` (no associated dataset) or a caller-tracked
+/// monotonic value if the caller wants to version their external index file
+/// against their source.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_ivf_pq_file_external(
+    object_store: &ObjectStore,
+    path: &Path,
+    column: &str,
+    index_name: &str,
+    dataset_version: u64,
+    mut ivf: IvfModel,
+    pq: ProductQuantizer,
+    streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
+) -> Result<()> {
+    let mut writer = object_store.create(path).await?;
     write_pq_partitions(writer.as_mut(), &mut ivf, Some(streams), None).await?;
 
     let metadata = IvfPQIndexMetadata::new(
         index_name.to_string(),
         column.to_string(),
-        dataset.version().version,
+        dataset_version,
         pq.distance_type,
         ivf,
         pq,
