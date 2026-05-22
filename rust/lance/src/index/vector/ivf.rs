@@ -1911,7 +1911,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     column: &str,
     index_name: &str,
     index_id: Uuid,
-    mut ivf: IvfModel,
+    ivf: IvfModel,
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
@@ -1920,13 +1920,48 @@ pub async fn write_ivf_pq_file_from_existing_index(
         .indices_dir()
         .join(index_id.to_string())
         .join("index.idx");
-    let mut writer = obj_store.create(&path).await?;
+    write_ivf_pq_file_external(
+        obj_store,
+        &path,
+        column,
+        index_name,
+        dataset.version().version,
+        ivf,
+        pq,
+        streams,
+    )
+    .await
+}
+
+/// Write an IVF-PQ index file directly to an `(ObjectStore, Path)` pair, with no
+/// `Dataset` dependency. Used by the external IVF-PQ builder
+/// ([`crate::index::vector::external::ExternalIvfPqIndex::build`]) — the build
+/// inputs (vectors + rids) come from caller-supplied parquet files, not a Lance
+/// dataset, so there's no manifest to read a version off and no `indices_dir` to
+/// derive a path from.
+///
+/// `dataset_version` is recorded in the index file's protobuf metadata. For
+/// external indices it can be `0` (no associated dataset) or a caller-tracked
+/// monotonic value if the caller wants to version their external index file
+/// against their source.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_ivf_pq_file_external(
+    object_store: &ObjectStore,
+    path: &Path,
+    column: &str,
+    index_name: &str,
+    dataset_version: u64,
+    mut ivf: IvfModel,
+    pq: ProductQuantizer,
+    streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
+) -> Result<()> {
+    let mut writer = object_store.create(path).await?;
     write_pq_partitions(writer.as_mut(), &mut ivf, Some(streams), None).await?;
 
     let metadata = IvfPQIndexMetadata::new(
         index_name.to_string(),
         column.to_string(),
-        dataset.version().version,
+        dataset_version,
         pq.distance_type,
         ivf,
         pq,
@@ -2251,7 +2286,7 @@ pub(crate) async fn merge_segments_with_progress(
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(crate::index::vector_index_details())),
+        index_details: Some(Arc::new(crate::index::vector_index_details_default())),
         index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
@@ -2350,12 +2385,16 @@ fn build_segment_plan(
         Some(index_type) => index_type.version(),
         None => infer_source_index_version(&group)?,
     };
-    let segment = IndexSegment::new(
-        segment_uuid,
-        fragment_bitmap,
-        Arc::new(crate::index::vector_index_details()),
-        index_version,
-    );
+
+    // Legacy source segments may not carry index_details. Fall back to an empty
+    // placeholder; `needs_vector_details_inference` will pick this up on the
+    // next manifest load and populate the real details from the index files.
+    let index_details = match first.index_details.as_ref() {
+        Some(d) => d.clone(),
+        None => Arc::new(crate::index::vector::details::vector_index_details_default()),
+    };
+
+    let segment = IndexSegment::new(segment_uuid, fragment_bitmap, index_details, index_version);
 
     Ok(IndexSegmentPlan::new(
         segment,
@@ -2722,7 +2761,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::IndexFileVersion;
-    use crate::index::vector_index_details;
+    use crate::index::vector_index_details_default;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
     use crate::utils::test::copy_test_data_to_tmp;
 
@@ -3195,7 +3234,7 @@ mod tests {
             fields: vec![field.id],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
@@ -3234,7 +3273,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
@@ -3294,7 +3333,7 @@ mod tests {
             fields: vec![field.id],
             name: format!("{}_remapped", INDEX_NAME),
             fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,

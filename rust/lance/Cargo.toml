@@ -55,6 +55,7 @@ deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
+moka.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
 aws-credential-types.optional = true
@@ -88,6 +89,9 @@ async_cell = "0.2.2"
 semver.workspace = true
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+# parquet is a runtime dep for the external vector index, which reads source
+# parquet files via page-index-aware random access (PageIndexPolicy::Required).
+parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
 
 [build-dependencies]
 prost-build.workspace = true
@@ -125,7 +129,6 @@ geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
-parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [features]
@@ -245,6 +248,14 @@ harness = false
 [[bench]]
 name = "mem_wal_fts_bench"
 path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
+harness = false
+
+[[bench]]
+name = "manifest_commit"
+harness = false
+
+[[bench]]
+name = "concurrent_append"
 harness = false
 
 [lints]

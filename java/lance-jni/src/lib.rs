@@ -46,6 +46,7 @@ mod blocking_scanner;
 mod delta;
 mod dispatcher;
 pub mod error;
+mod external_index;
 pub mod ffi;
 mod file_reader;
 mod file_writer;

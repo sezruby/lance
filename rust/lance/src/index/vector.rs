@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 pub mod builder;
+pub(crate) mod details;
+pub mod external;
 pub mod ivf;
 pub mod pq;
 pub mod utils;
@@ -59,7 +61,7 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
+use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb};
 use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
@@ -265,6 +267,11 @@ pub struct VectorIndexParams {
 
     /// Skip transpose / packing for PQ and RQ storage.
     pub skip_transpose: bool,
+
+    /// Runtime hints: optional build preferences stored in the index manifest.
+    /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
+    /// Populated by the build path and merged into VectorIndexDetails at creation time.
+    pub runtime_hints: HashMap<String, String>,
 }
 
 impl VectorIndexParams {
@@ -286,6 +293,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -296,6 +304,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -330,6 +339,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -356,6 +366,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -371,6 +382,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -385,6 +397,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -399,6 +412,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -413,6 +427,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -434,6 +449,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -455,6 +471,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -1791,7 +1808,7 @@ pub async fn initialize_vector_index(
         fields: vec![field.id],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
-        index_details: Some(Arc::new(vector_index_details())),
+        index_details: source_index.index_details.clone(),
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,

@@ -72,10 +72,34 @@ public class MemWalTest {
               new Field(
                   "id", new FieldType(false, new ArrowType.Int(64, true), null, PK_META), null),
               Field.nullable("name", new ArrowType.Utf8())));
+  private static final Schema APPEND_ONLY_SCHEMA =
+      new Schema(
+          Arrays.asList(
+              new Field(
+                  "id",
+                  new FieldType(false, new ArrowType.Int(64, true), null, Collections.emptyMap()),
+                  null),
+              Field.nullable("name", new ArrowType.Utf8())));
 
   /** Build a single-batch root where {@code name = "{prefix}_{id}"}. */
   private static VectorSchemaRoot lookupRoot(BufferAllocator allocator, long[] ids, String prefix) {
     VectorSchemaRoot root = VectorSchemaRoot.create(LOOKUP_SCHEMA, allocator);
+    BigIntVector idVector = (BigIntVector) root.getVector("id");
+    VarCharVector nameVector = (VarCharVector) root.getVector("name");
+    idVector.allocateNew(ids.length);
+    nameVector.allocateNew();
+    for (int i = 0; i < ids.length; i++) {
+      idVector.set(i, ids[i]);
+      nameVector.setSafe(i, (prefix + "_" + ids[i]).getBytes(StandardCharsets.UTF_8));
+    }
+    root.setRowCount(ids.length);
+    return root;
+  }
+
+  /** Build a single-batch append-only root without primary-key metadata. */
+  private static VectorSchemaRoot appendOnlyRoot(
+      BufferAllocator allocator, long[] ids, String prefix) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(APPEND_ONLY_SCHEMA, allocator);
     BigIntVector idVector = (BigIntVector) root.getVector("id");
     VarCharVector nameVector = (VarCharVector) root.getVector("name");
     idVector.allocateNew(ids.length);
@@ -104,6 +128,15 @@ public class MemWalTest {
   private static Dataset writeLookupDataset(
       BufferAllocator allocator, String path, long[] ids, String prefix) throws Exception {
     try (VectorSchemaRoot root = lookupRoot(allocator, ids, prefix);
+        ArrowReader reader = toReader(allocator, root)) {
+      return Dataset.write().allocator(allocator).reader(reader).uri(path).execute();
+    }
+  }
+
+  /** Write an append-only base dataset of `(id, name)` rows at {@code path}. */
+  private static Dataset writeAppendOnlyDataset(
+      BufferAllocator allocator, String path, long[] ids, String prefix) throws Exception {
+    try (VectorSchemaRoot root = appendOnlyRoot(allocator, ids, prefix);
         ArrowReader reader = toReader(allocator, root)) {
       return Dataset.write().allocator(allocator).reader(reader).uri(path).execute();
     }
@@ -142,6 +175,127 @@ public class MemWalTest {
       Optional<MemWalIndexDetails> details = dataset.memWalIndexDetails();
       assertTrue(details.isPresent());
       assertEquals(Collections.emptyList(), details.get().maintainedIndexes());
+    }
+  }
+
+  @Test
+  void testInitializeMemWalBucketShardingWithoutPrimaryKey(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("append_only").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeAppendOnlyDataset(allocator, path, new long[] {1, 2, 3}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams().withBucketSharding("id", 4));
+
+      Optional<MemWalIndexDetails> details = dataset.memWalIndexDetails();
+      assertTrue(details.isPresent());
+      assertEquals(4L, details.get().numShards());
+      ShardingField field = details.get().shardingSpecs().get(0).fields().get(0);
+      assertEquals("bucket", field.transform().get());
+      assertEquals("4", field.parameters().get("num_buckets"));
+    }
+  }
+
+  @Test
+  void testInitializeMemWalBucketShardingUsesConfiguredColumn(@TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("base").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {1, 2, 3}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams().withBucketSharding("name", 4));
+
+      MemWalIndexDetails details = dataset.memWalIndexDetails().get();
+      ShardingField field = details.shardingSpecs().get(0).fields().get(0);
+      int nameFieldId =
+          dataset.getLanceSchema().fields().stream()
+              .filter(f -> f.getName().equals("name"))
+              .findFirst()
+              .get()
+              .getId();
+      assertEquals("bucket", field.transform().get());
+      assertEquals(nameFieldId, field.sourceIds().get(0));
+    }
+  }
+
+  @Test
+  void testShardingEvaluatorBucketAndIdentity(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("append_only").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeAppendOnlyDataset(allocator, path, new long[] {1}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams().withBucketSharding("id", 4));
+      ShardingSpec bucketSpec = dataset.memWalIndexDetails().get().shardingSpecs().get(0);
+      ShardingField bucketField = bucketSpec.fields().get(0);
+
+      try (VectorSchemaRoot root = appendOnlyRoot(allocator, new long[] {1, 2, 3}, "eval");
+          ArrowReader reader =
+              ShardingEvaluator.evaluate(allocator, root, bucketSpec, dataset.getLanceSchema())) {
+        assertTrue(reader.loadNextBatch());
+        VectorSchemaRoot result = reader.getVectorSchemaRoot();
+        IntVector buckets = (IntVector) result.getVector(bucketField.fieldId());
+        assertEquals(3, result.getRowCount());
+        assertEquals(0, buckets.get(0));
+        assertEquals(0, buckets.get(1));
+        assertEquals(3, buckets.get(2));
+        assertFalse(reader.loadNextBatch());
+      }
+
+      int nameFieldId =
+          dataset.getLanceSchema().fields().stream()
+              .filter(f -> f.getName().equals("name"))
+              .findFirst()
+              .get()
+              .getId();
+      ShardingSpec identitySpec =
+          new ShardingSpec(
+              7,
+              Collections.singletonList(
+                  new ShardingField(
+                      "name_identity",
+                      Collections.singletonList(nameFieldId),
+                      "identity",
+                      null,
+                      "utf8",
+                      Collections.emptyMap())));
+      try (VectorSchemaRoot root = appendOnlyRoot(allocator, new long[] {1}, "eval");
+          ArrowReader reader =
+              ShardingEvaluator.evaluate(allocator, root, identitySpec, dataset.getLanceSchema())) {
+        assertTrue(reader.loadNextBatch());
+        VarCharVector names =
+            (VarCharVector) reader.getVectorSchemaRoot().getVector("name_identity");
+        assertEquals("eval_1", new String(names.get(0), StandardCharsets.UTF_8));
+        assertFalse(reader.loadNextBatch());
+      }
+
+      Map<String, String> stringBucketParameters = new HashMap<>();
+      stringBucketParameters.put("column", "key");
+      stringBucketParameters.put("num_buckets", "8");
+      ShardingSpec stringBucketSpec =
+          new ShardingSpec(
+              8,
+              Collections.singletonList(
+                  new ShardingField(
+                      "key_bucket",
+                      Collections.emptyList(),
+                      "bucket",
+                      null,
+                      "int32",
+                      stringBucketParameters)));
+      Schema stringSchema =
+          new Schema(Collections.singletonList(Field.nullable("key", new ArrowType.Utf8())));
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(stringSchema, allocator)) {
+        VarCharVector keyVector = (VarCharVector) root.getVector("key");
+        keyVector.allocateNew();
+        keyVector.setSafe(0, "a".getBytes(StandardCharsets.UTF_8));
+        keyVector.setSafe(1, "b".getBytes(StandardCharsets.UTF_8));
+        keyVector.setNull(2);
+        root.setRowCount(3);
+        try (ArrowReader reader = ShardingEvaluator.evaluate(allocator, root, stringBucketSpec)) {
+          assertTrue(reader.loadNextBatch());
+          IntVector buckets = (IntVector) reader.getVectorSchemaRoot().getVector("key_bucket");
+          assertEquals(1, buckets.get(0));
+          assertEquals(5, buckets.get(1));
+          assertEquals(0, buckets.get(2));
+          assertFalse(reader.loadNextBatch());
+        }
+      }
     }
   }
 
