@@ -12,7 +12,8 @@ use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
-    MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeStats, SourceDedupeBehavior, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
 use lance_index::mem_wal::MergedGeneration;
@@ -52,6 +53,7 @@ fn inner_merge_insert<'local>(
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
     let use_index = extract_use_index(env, &jparam)?;
+    let source_dedupe_behavior = extract_source_dedupe_behavior(env, &jparam)?;
     let marked_generations = extract_marked_generations(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
@@ -71,6 +73,7 @@ fn inner_merge_insert<'local>(
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
+            .source_dedupe_behavior(source_dedupe_behavior)
             .mark_generations_as_merged(marked_generations)
             .try_build()?;
 
@@ -239,6 +242,29 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
 fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<bool> {
     let use_index = env.call_method(jparam, "useIndex", "()Z", &[])?.z()?;
     Ok(use_index)
+}
+
+fn extract_source_dedupe_behavior<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<SourceDedupeBehavior> {
+    let behavior: JString = env
+        .call_method(
+            jparam,
+            "sourceDedupeBehaviorValue",
+            "()Ljava/lang/String;",
+            &[],
+        )?
+        .l()?
+        .into();
+    let behavior = behavior.extract(env)?;
+    match behavior.as_str() {
+        "Fail" => Ok(SourceDedupeBehavior::Fail),
+        "FirstSeen" => Ok(SourceDedupeBehavior::FirstSeen),
+        _ => Err(Error::input_error(format!(
+            "Illegal source_dedupe_behavior: {behavior}",
+        ))),
+    }
 }
 
 fn extract_marked_generations<'local>(
