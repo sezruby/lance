@@ -1992,6 +1992,64 @@ public class Dataset implements Closeable {
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   /**
+   * Run a merge insert but do NOT commit it. Returns the resulting {@link Transaction} encoded as
+   * protobuf bytes.
+   *
+   * <p>The new data fragments are written to storage, but the dataset's manifest is unchanged. The
+   * returned bytes can be shipped to another process (e.g. a Spark executor returning the
+   * transaction to the driver) and later combined with other uncommitted merge transactions and
+   * committed as a single operation via {@link #commitMergeTransactions(byte[][])}.
+   *
+   * <p>This is the building block for distributed merge insert: each partition of the source runs
+   * an uncommitted merge against a disjoint (or deletion-vector-unionable) set of target fragments,
+   * and the driver commits all of them once.
+   *
+   * @param mergeInsert merge insert options
+   * @param source ArrowArrayStream source data for this partition
+   * @return the uncommitted {@link Transaction} as protobuf bytes
+   */
+  public byte[] mergeInsertUncommitted(MergeInsertParams mergeInsert, ArrowArrayStream source) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      return nativeMergeInsertUncommitted(mergeInsert, source.memoryAddress());
+    }
+  }
+
+  private native byte[] nativeMergeInsertUncommitted(
+      MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Combine several uncommitted merge-insert transactions (from {@link #mergeInsertUncommitted})
+   * into a single transaction and commit it as one operation.
+   *
+   * <p>This is the driver-side step of a distributed merge insert: collect the protobuf-encoded
+   * transaction bytes returned by each partition's {@link #mergeInsertUncommitted}, then call this
+   * to union per-fragment deletion vectors and commit all of them at once. No data is rewritten —
+   * only the deletion files for fragments touched by more than one partition are re-written (the
+   * union of the disjoint deleted row sets).
+   *
+   * <p>All transactions must share the same read version, and the deleted row sets within any
+   * shared fragment must be disjoint (guaranteed when the source is deduplicated and partitioned by
+   * merge key). The current dataset is changed and should be closed; the merged dataset is
+   * returned.
+   *
+   * @param transactionBytes one protobuf-encoded transaction per source partition
+   * @return the new committed {@link Dataset}
+   */
+  public Dataset commitMergeTransactions(byte[][] transactionBytes) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Dataset newDataset = nativeCommitMergeTransactions(transactionBytes);
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+      return newDataset;
+    }
+  }
+
+  private native Dataset nativeCommitMergeTransactions(byte[][] transactionBytes);
+
+  /**
    * Update column values for rows matching an optional predicate.
    *
    * <p>This is similar to SQL's {@code UPDATE} statement: the entries of {@link

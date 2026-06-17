@@ -104,7 +104,7 @@ use lance_core::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{InvalidInputSnafu, box_error},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{deletion::DeletionVector, futures::Capacity, tokio::get_num_compute_intensive_cpus},
 };
 use lance_datafusion::{
     chunker::chunk_stream,
@@ -2076,6 +2076,139 @@ pub struct UncommittedMergeInsert {
     pub affected_rows: Option<RowAddrTreeMap>,
     pub stats: MergeStats,
     pub inserted_rows_filter: Option<KeyExistenceFilter>,
+}
+
+/// Combine several uncommitted merge-insert transactions (each an
+/// `Operation::Update`, all computed against the same `read_version`) into a
+/// single transaction that can be committed once.
+///
+/// This is the driver-side step of a distributed merge insert: each source
+/// partition produced an independent uncommitted merge (via
+/// [`MergeInsertJob::execute_uncommitted`]) that already wrote its new data
+/// fragments to storage. This function stitches their metadata together — it
+/// does NOT rewrite any data:
+///
+/// - `new_fragments` are concatenated (row IDs are assigned later, once, by the
+///   single commit).
+/// - `removed_fragment_ids` are unioned.
+/// - For any existing fragment that more than one transaction modified (i.e. two
+///   partitions deleted different rows from the same physical fragment), the
+///   per-fragment deletion vectors are read, OR-ed together, and re-written as a
+///   single small deletion file. The deleted row sets must be disjoint
+///   (guaranteed when the source is deduplicated and partitioned by merge key);
+///   overlapping deletions indicate two partitions claimed the same target row
+///   and are rejected.
+///
+/// All input transactions must be `Operation::Update` with the same
+/// `read_version`; otherwise an error is returned.
+pub async fn combine_merge_transactions(
+    dataset: &Dataset,
+    transactions: Vec<Transaction>,
+) -> Result<Transaction> {
+    use lance_table::io::deletion::write_deletion_file;
+
+    if transactions.is_empty() {
+        return Err(Error::invalid_input(
+            "combine_merge_transactions requires at least one transaction".to_string(),
+        ));
+    }
+
+    let read_version = transactions[0].read_version;
+    let mut removed_fragment_ids: Vec<u64> = Vec::new();
+    let mut new_fragments: Vec<Fragment> = Vec::new();
+    let mut fields_modified: Vec<u32> = Vec::new();
+    // Merge updated fragments by id; union deletion vectors on collision.
+    let mut updated_by_id: std::collections::BTreeMap<u64, Fragment> = Default::default();
+
+    for txn in &transactions {
+        if txn.read_version != read_version {
+            return Err(Error::invalid_input(format!(
+                "all merge transactions must share read_version; expected {}, got {}",
+                read_version, txn.read_version
+            )));
+        }
+        let Operation::Update {
+            removed_fragment_ids: rem,
+            updated_fragments,
+            new_fragments: new_frags,
+            fields_modified: fm,
+            ..
+        } = &txn.operation
+        else {
+            return Err(Error::invalid_input(format!(
+                "combine_merge_transactions only supports Operation::Update, got {}",
+                txn.operation.name()
+            )));
+        };
+
+        removed_fragment_ids.extend(rem.iter().copied());
+        new_fragments.extend(new_frags.iter().cloned());
+        fields_modified.extend(fm.iter().copied());
+
+        for frag in updated_fragments {
+            match updated_by_id.get_mut(&frag.id) {
+                None => {
+                    updated_by_id.insert(frag.id, frag.clone());
+                }
+                Some(existing) => {
+                    // Shared fragment: union the two deletion bitmaps.
+                    let a = read_fragment_deletions(dataset, existing).await?;
+                    let b = read_fragment_deletions(dataset, frag).await?;
+                    if !a.is_disjoint(&b) {
+                        return Err(Error::invalid_input(format!(
+                            "two merge partitions deleted the same row(s) in fragment {} — \
+                             the source is not partitioned by merge key (or not deduplicated)",
+                            frag.id
+                        )));
+                    }
+                    let union = &a | &b;
+                    let dv = DeletionVector::from(union);
+                    existing.deletion_file = write_deletion_file(
+                        &dataset.base,
+                        existing.id,
+                        read_version,
+                        &dv,
+                        dataset.object_store.as_ref(),
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    fields_modified.sort_unstable();
+    fields_modified.dedup();
+
+    let operation = Operation::Update {
+        removed_fragment_ids,
+        updated_fragments: updated_by_id.into_values().collect(),
+        new_fragments,
+        fields_modified,
+        merged_generations: Vec::new(),
+        fields_for_preserving_frag_bitmap: Vec::new(),
+        update_mode: None,
+        inserted_rows_filter: None,
+        updated_fragment_offsets: None,
+    };
+
+    Ok(Transaction::new(read_version, operation, None))
+}
+
+/// Read a fragment's deletion vector as a `RoaringBitmap` (empty if none).
+async fn read_fragment_deletions(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<roaring::RoaringBitmap> {
+    use crate::io::deletion::read_dataset_deletion_file;
+    match &fragment.deletion_file {
+        Some(df) => {
+            let dv = read_dataset_deletion_file(dataset, fragment.id, df).await?;
+            Ok(roaring::RoaringBitmap::from_iter(
+                dv.as_ref().to_sorted_iter(),
+            ))
+        }
+        None => Ok(roaring::RoaringBitmap::new()),
+    }
 }
 
 /// Wrapper struct that combines MergeInsertJob with the source iterator for retry functionality
@@ -9922,6 +10055,468 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             count_data_files(test_uri),
             baseline_files,
             "Newly written merge-insert data files should be cleaned up on apply_deletions failure"
+        );
+    }
+
+    /// Proof-of-concept for distributed merge insert: run two independent
+    /// `execute_uncommitted` merges against the SAME base version, each touching
+    /// a disjoint set of target fragments (as a key-hash-partitioned source
+    /// would), then combine the two `Operation::Update`s into a single
+    /// transaction and commit once. This is the load-bearing assumption behind
+    /// a "concurrent merge on executors, commit once on the driver" design:
+    /// disjoint-fragment merges combine by concatenating the fragment vectors,
+    /// with no re-run / no conflict.
+    #[tokio::test]
+    async fn test_combine_disjoint_uncommitted_merges() {
+        // 6-row table across 2 fragments (3 rows each): frag A holds keys 0,1,2;
+        // frag B holds keys 3,4,5. max_rows_per_file=3 forces the split.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(UInt32Array::from(vec![0, 10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            })
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        assert_eq!(dataset.get_fragments().len(), 2, "expected 2 fragments");
+        let base_version = dataset.manifest().version;
+
+        // Source A: update key 1 (frag A) + insert key 6. Disjoint from B.
+        let src_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 6])),
+                Arc::new(UInt32Array::from(vec![111, 666])),
+            ],
+        )
+        .unwrap();
+        // Source B: update key 4 (frag B) + insert key 7. Disjoint from A.
+        let src_b = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 7])),
+                Arc::new(UInt32Array::from(vec![444, 777])),
+            ],
+        )
+        .unwrap();
+
+        let run_uncommitted = |batch: RecordBatch| {
+            let dataset = dataset.clone();
+            let schema = schema.clone();
+            async move {
+                let stream = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch)]),
+                );
+                MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Both merges run against the same base version (as concurrent executors would).
+        let unc_a = run_uncommitted(src_a).await;
+        let unc_b = run_uncommitted(src_b).await;
+
+        // Each uncommitted merge has ALREADY WRITTEN its new fragment(s) to
+        // storage during execute_uncommitted; the transaction references them by
+        // concrete data-file path. Collect those paths — the commit below must
+        // reuse these exact files and write no new data.
+        let data_file_paths = |t: &Transaction| -> Vec<String> {
+            match &t.operation {
+                Operation::Update { new_fragments, .. } => new_fragments
+                    .iter()
+                    .flat_map(|f| f.files.iter().map(|df| df.path.clone()))
+                    .collect(),
+                _ => panic!("expected Operation::Update"),
+            }
+        };
+        let mut uncommitted_paths = data_file_paths(&unc_a.transaction);
+        uncommitted_paths.extend(data_file_paths(&unc_b.transaction));
+        uncommitted_paths.sort();
+        assert!(
+            uncommitted_paths.len() >= 2,
+            "each merge wrote at least one new data file before commit: {uncommitted_paths:?}"
+        );
+
+        // Combine: both are Operation::Update. Disjoint fragments → concatenate
+        // removed_fragment_ids / updated_fragments / new_fragments. (No shared
+        // fragment here, so no deletion-vector union is needed.)
+        let combined_op = combine_updates(&unc_a.transaction, &unc_b.transaction);
+        let combined_txn = Transaction::new(base_version, combined_op, None);
+
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute(combined_txn)
+            .await
+            .unwrap();
+        let committed = Arc::new(committed);
+
+        // The committed manifest must reference the EXACT data files the two
+        // uncommitted merges already wrote — no data rewrite during combine/commit.
+        let mut committed_paths: Vec<String> = committed
+            .get_fragments()
+            .iter()
+            .flat_map(|f| f.metadata().files.iter().map(|df| df.path.clone()))
+            .collect();
+        committed_paths.sort();
+        for p in &uncommitted_paths {
+            assert!(
+                committed_paths.contains(p),
+                "committed manifest must reference the pre-written data file {p} \
+                 (combine is metadata-only, no rewrite). committed={committed_paths:?}"
+            );
+        }
+
+        // Verify final state: 8 rows, both updates applied, both inserts present.
+        let batches = committed
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut by_id: std::collections::BTreeMap<u32, u32> = Default::default();
+        for b in &batches {
+            let ids = b.column(0).as_primitive::<UInt32Type>();
+            let vals = b.column(1).as_primitive::<UInt32Type>();
+            for i in 0..b.num_rows() {
+                by_id.insert(ids.value(i), vals.value(i));
+            }
+        }
+
+        assert_eq!(by_id.len(), 8, "6 original + 2 inserts = 8 rows: {by_id:?}");
+        assert_eq!(by_id[&1], 111, "key 1 updated by merge A");
+        assert_eq!(by_id[&4], 444, "key 4 updated by merge B");
+        assert_eq!(by_id[&6], 666, "key 6 inserted by merge A");
+        assert_eq!(by_id[&7], 777, "key 7 inserted by merge B");
+        // Untouched rows survive.
+        assert_eq!(by_id[&0], 0);
+        assert_eq!(by_id[&2], 20);
+        assert_eq!(by_id[&3], 30);
+        assert_eq!(by_id[&5], 50);
+    }
+
+    /// Combine two disjoint-fragment merge `Operation::Update`s into one.
+    /// Panics if either transaction is not an `Update` (this PoC only handles
+    /// the merge-insert shape).
+    fn combine_updates(a: &Transaction, b: &Transaction) -> Operation {
+        let unpack = |t: &Transaction| match &t.operation {
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified,
+                ..
+            } => (
+                removed_fragment_ids.clone(),
+                updated_fragments.clone(),
+                new_fragments.clone(),
+                fields_modified.clone(),
+            ),
+            other => panic!("expected Operation::Update, got {other:?}"),
+        };
+        let (mut rem_a, mut upd_a, mut new_a, mut fm_a) = unpack(a);
+        let (rem_b, upd_b, new_b, fm_b) = unpack(b);
+        rem_a.extend(rem_b);
+        upd_a.extend(upd_b);
+        new_a.extend(new_b);
+        fm_a.extend(fm_b);
+        fm_a.sort_unstable();
+        fm_a.dedup();
+        Operation::Update {
+            removed_fragment_ids: rem_a,
+            updated_fragments: upd_a,
+            new_fragments: new_a,
+            fields_modified: fm_a,
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: Vec::new(),
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        }
+    }
+
+    /// Non-disjoint case: two merges against the same base BOTH update rows in
+    /// the SAME physical fragment (keys 0 and 2 both live in frag A). Each
+    /// uncommitted merge produces its own deletion file for frag A. The naive
+    /// `combine_updates` (concatenate `updated_fragments`) therefore yields two
+    /// entries for the same fragment id — this test characterizes what the
+    /// commit does with that: correct union, last-writer-wins clobber, or error.
+    #[tokio::test]
+    async fn test_combine_nondisjoint_uncommitted_merges() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(UInt32Array::from(vec![0, 10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            })
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let base_version = dataset.manifest().version;
+
+        // Both sources update rows in the SAME fragment (keys 0 and 2 → frag A).
+        let src_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![100])),
+            ],
+        )
+        .unwrap();
+        let src_b = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2])),
+                Arc::new(UInt32Array::from(vec![200])),
+            ],
+        )
+        .unwrap();
+
+        let run_uncommitted = |batch: RecordBatch| {
+            let dataset = dataset.clone();
+            let schema = schema.clone();
+            async move {
+                let stream = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch)]),
+                );
+                MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let unc_a = run_uncommitted(src_a).await;
+        let unc_b = run_uncommitted(src_b).await;
+
+        // Data-file paths the two merges wrote (must be preserved through combine).
+        let new_paths = |t: &Transaction| -> Vec<String> {
+            match &t.operation {
+                Operation::Update { new_fragments, .. } => new_fragments
+                    .iter()
+                    .flat_map(|f| f.files.iter().map(|df| df.path.clone()))
+                    .collect(),
+                _ => panic!("expected Update"),
+            }
+        };
+        let mut written_paths = new_paths(&unc_a.transaction);
+        written_paths.extend(new_paths(&unc_b.transaction));
+
+        // Combine WITH deletion-vector union for shared fragments, via the real
+        // public API. Reads the two independently-computed deletion files for
+        // frag A, unions the bitmaps, writes ONE new (small) deletion file — the
+        // data fragments are NOT rewritten.
+        let combined_txn = combine_merge_transactions(
+            dataset.as_ref(),
+            vec![unc_a.transaction, unc_b.transaction],
+        )
+        .await
+        .unwrap();
+        assert_eq!(combined_txn.read_version, base_version);
+
+        let committed = Arc::new(
+            CommitBuilder::new(dataset.clone())
+                .execute(combined_txn)
+                .await
+                .unwrap(),
+        );
+
+        let batches = committed
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut by_id: std::collections::BTreeMap<u32, u32> = Default::default();
+        let mut total_rows = 0usize;
+        for b in &batches {
+            total_rows += b.num_rows();
+            let ids = b.column(0).as_primitive::<UInt32Type>();
+            let vals = b.column(1).as_primitive::<UInt32Type>();
+            for i in 0..b.num_rows() {
+                by_id.insert(ids.value(i), vals.value(i));
+            }
+        }
+
+        // Both updates landed, no ghost row, exactly 6 rows.
+        assert_eq!(total_rows, 6, "exactly 6 rows, no ghost: {by_id:?}");
+        assert_eq!(total_rows, by_id.len(), "no duplicate ids: {by_id:?}");
+        assert_eq!(by_id[&0], 100, "key 0 updated by merge A");
+        assert_eq!(by_id[&2], 200, "key 2 updated by merge B");
+        assert_eq!(by_id[&1], 10, "untouched row in shared fragment survives");
+
+        // Data files written by the merges are referenced verbatim — not rewritten.
+        let committed_paths: Vec<String> = committed
+            .get_fragments()
+            .iter()
+            .flat_map(|f| f.metadata().files.iter().map(|df| df.path.clone()))
+            .collect();
+        for p in &written_paths {
+            assert!(
+                committed_paths.contains(p),
+                "merge-written data file {p} must be referenced verbatim (no rewrite)"
+            );
+        }
+    }
+
+    /// Does combining two independently-executed merges produce UNIQUE `_rowid`s,
+    /// or do the two merges' inserted rows collide on row id? Runs with stable
+    /// row ids enabled (the mode where a collision would corrupt the row-id
+    /// index). Each merge inserts a new key into a different fragment; we scan
+    /// `_rowid` after the combined commit and assert global uniqueness.
+    #[tokio::test]
+    async fn test_combine_rowid_uniqueness() {
+        use lance_core::ROW_ID;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(UInt32Array::from(vec![0, 10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            })
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let base_version = dataset.manifest().version;
+
+        // A: update key 1 + insert key 6.  B: update key 4 + insert key 7.
+        let src_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 6])),
+                Arc::new(UInt32Array::from(vec![111, 666])),
+            ],
+        )
+        .unwrap();
+        let src_b = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 7])),
+                Arc::new(UInt32Array::from(vec![444, 777])),
+            ],
+        )
+        .unwrap();
+
+        let run = |batch: RecordBatch| {
+            let dataset = dataset.clone();
+            let schema = schema.clone();
+            async move {
+                let stream = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch)]),
+                );
+                MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let unc_a = run(src_a).await;
+        let unc_b = run(src_b).await;
+
+        let combined_op = combine_updates(&unc_a.transaction, &unc_b.transaction);
+        let combined_txn = Transaction::new(base_version, combined_op, None);
+        let committed = Arc::new(
+            CommitBuilder::new(dataset.clone())
+                .execute(combined_txn)
+                .await
+                .unwrap(),
+        );
+
+        // Scan _rowid and check global uniqueness.
+        let batches = committed
+            .scan()
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut row_ids: Vec<u64> = Vec::new();
+        for b in &batches {
+            let rid = b
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>();
+            for i in 0..b.num_rows() {
+                row_ids.push(rid.value(i));
+            }
+        }
+        let mut sorted = row_ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        println!(
+            "ROWID combine: count={} unique={} ids={:?}",
+            row_ids.len(),
+            sorted.len(),
+            row_ids
+        );
+        assert_eq!(
+            row_ids.len(),
+            sorted.len(),
+            "combined merge produced duplicate _rowid(s): {row_ids:?}"
         );
     }
 }

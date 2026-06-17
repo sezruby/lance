@@ -131,7 +131,7 @@ pub use take::TakeBuilder;
 use uuid::Uuid;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
-    WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    WhenMatched, WhenNotMatched, WhenNotMatchedBySource, combine_merge_transactions,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;

@@ -8,8 +8,8 @@ use crate::traits::{FromJString, IntoJava};
 use crate::{Error, JNIEnvExt, RT};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::JNIEnv;
-use jni::objects::{JObject, JString, JValueGen};
-use jni::sys::jlong;
+use jni::objects::{JByteArray, JObject, JString, JValueGen};
+use jni::sys::{jbyteArray, jint, jlong};
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
     MergeInsertBuilder, MergeStats, SourceDedupeBehavior, WhenMatched, WhenNotMatched,
@@ -17,6 +17,8 @@ use lance::dataset::{
 };
 use lance_core::datatypes::Schema;
 use lance_index::mem_wal::MergedGeneration;
+use prost::Message;
+use std::mem::transmute;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -34,38 +36,34 @@ pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn inner_merge_insert<'local>(
-    env: &mut JNIEnv<'local>,
-    jdataset: JObject,
-    jparam: JObject,
-    batch_address: jlong,
-) -> Result<JObject<'local>> {
-    let on = extract_on(env, &jparam)?;
-    let when_matched = extract_when_matched(env, &jparam)?;
-    let when_not_matched = extract_when_not_matached(env, &jparam)?;
-
-    let when_not_matched_by_source_str = extract_when_not_matched_by_source_str(env, &jparam)?;
+/// Build a `MergeInsertJob` from the Java `MergeInsertParams`, sharing all the
+/// param extraction between the committed and uncommitted merge entry points.
+fn build_merge_job(
+    env: &mut JNIEnv<'_>,
+    jdataset: &JObject,
+    jparam: &JObject,
+) -> Result<lance::dataset::MergeInsertJob> {
+    let on = extract_on(env, jparam)?;
+    let when_matched = extract_when_matched(env, jparam)?;
+    let when_not_matched = extract_when_not_matached(env, jparam)?;
+    let when_not_matched_by_source_str = extract_when_not_matched_by_source_str(env, jparam)?;
     let when_not_matched_by_source_delete_expr =
-        extract_when_not_matched_by_source_delete_expr(env, &jparam)?;
+        extract_when_not_matched_by_source_delete_expr(env, jparam)?;
+    let conflict_retries = extract_conflict_retries(env, jparam)?;
+    let retry_timeout_ms = extract_retry_timeout_ms(env, jparam)?;
+    let skip_auto_cleanup = extract_skip_auto_cleanup(env, jparam)?;
+    let use_index = extract_use_index(env, jparam)?;
+    let source_dedupe_behavior = extract_source_dedupe_behavior(env, jparam)?;
+    let marked_generations = extract_marked_generations(env, jparam)?;
 
-    let conflict_retries = extract_conflict_retries(env, &jparam)?;
-    let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
-    let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
-    let use_index = extract_use_index(env, &jparam)?;
-    let source_dedupe_behavior = extract_source_dedupe_behavior(env, &jparam)?;
-    let marked_generations = extract_marked_generations(env, &jparam)?;
-
-    let (new_ds, merge_stats) = unsafe {
+    unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
-
         let when_not_matched_by_source = extract_when_not_matched_by_source(
             dataset.inner.schema(),
             when_not_matched_by_source_str.as_str(),
             when_not_matched_by_source_delete_expr,
         )?;
-
-        let merge_insert_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
             .when_not_matched_by_source(when_not_matched_by_source)
@@ -76,10 +74,115 @@ fn inner_merge_insert<'local>(
             .source_dedupe_behavior(source_dedupe_behavior)
             .mark_generations_as_merged(marked_generations)
             .try_build()?;
+        Ok(job)
+    }
+}
 
+/// Uncommitted merge insert: runs the merge (writes new data fragments to
+/// storage) but does NOT commit. Returns the resulting `Transaction` encoded as
+/// protobuf bytes, so a distributed caller can ship it (e.g. Spark executor →
+/// driver) and later combine + commit several such transactions as one.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsertUncommitted<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+    jparam: JObject,
+    batch_address: jlong,
+) -> jbyteArray {
+    match inner_merge_insert_uncommitted(&mut env, jdataset, jparam, batch_address) {
+        Ok(arr) => arr.into_raw(),
+        Err(e) => {
+            e.throw(&mut env);
+            JByteArray::default().into_raw()
+        }
+    }
+}
+
+fn inner_merge_insert_uncommitted<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jparam: JObject,
+    batch_address: jlong,
+) -> Result<JByteArray<'local>> {
+    let merge_insert_job = build_merge_job(env, &jdataset, &jparam)?;
+
+    let uncommitted = unsafe {
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
+        RT.block_on(async move { merge_insert_job.execute_uncommitted(source_stream).await })?
+    };
 
+    let pb_txn = lance_table::format::pb::Transaction::from(&uncommitted.transaction);
+    let bytes = pb_txn.encode_to_vec();
+    let arr = env.new_byte_array(bytes.len() as jint)?;
+    let i8_slice: &[i8] = unsafe { transmute(bytes.as_slice()) };
+    env.set_byte_array_region(&arr, 0, i8_slice)?;
+    Ok(arr)
+}
+
+/// Combine several uncommitted merge transactions (each protobuf-encoded
+/// `Transaction` bytes from [`Java_org_lance_Dataset_nativeMergeInsertUncommitted`])
+/// into a single transaction — unioning per-fragment deletion vectors — and
+/// commit it as one operation. Returns the new committed `Dataset`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeCommitMergeTransactions<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+    txn_bytes_array: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        inner_commit_merge_transactions(&mut env, jdataset, txn_bytes_array)
+    )
+}
+
+fn inner_commit_merge_transactions<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    txn_bytes_array: JObject,
+) -> Result<JObject<'local>> {
+    use jni::objects::JObjectArray;
+    use lance::dataset::{CommitBuilder, combine_merge_transactions};
+
+    // Decode each byte[] element into a Rust Transaction.
+    let array = JObjectArray::from(txn_bytes_array);
+    let n = env.get_array_length(&array)?;
+    let mut transactions = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let elem = env.get_object_array_element(&array, i)?;
+        let bytes = env.convert_byte_array(JByteArray::from(elem))?;
+        let pb_txn = lance_table::format::pb::Transaction::decode(bytes.as_slice())
+            .map_err(|e| Error::input_error(format!("failed to decode transaction: {e}")))?;
+        let txn = lance::dataset::transaction::Transaction::try_from(pb_txn)
+            .map_err(|e| Error::input_error(format!("invalid transaction: {e}")))?;
+        transactions.push(txn);
+    }
+
+    let new_ds = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&jdataset, NATIVE_DATASET)? };
+        let base = Arc::new(dataset.clone().inner);
+        RT.block_on(async move {
+            let combined = combine_merge_transactions(base.as_ref(), transactions).await?;
+            CommitBuilder::new(base).execute(combined).await
+        })?
+    };
+
+    BlockingDataset { inner: new_ds }.into_java(env)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_merge_insert<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jparam: JObject,
+    batch_address: jlong,
+) -> Result<JObject<'local>> {
+    let merge_insert_job = build_merge_job(env, &jdataset, &jparam)?;
+
+    let (new_ds, merge_stats) = unsafe {
+        let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
+        let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
         RT.block_on(async move { merge_insert_job.execute_reader(source_stream).await })?
     };
 

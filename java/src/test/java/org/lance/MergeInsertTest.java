@@ -355,6 +355,55 @@ public class MergeInsertTest {
   }
 
   @Test
+  public void testDistributedMergeUncommittedThenCommit() throws Exception {
+    // Simulate the distributed merge: two "partitions" each run an uncommitted
+    // merge (writes data, returns a serialized transaction), then the "driver"
+    // combines + commits them as one operation. Disjoint inserted keys.
+    byte[] txnA;
+    byte[] txnB;
+
+    try (VectorSchemaRoot sourceA = buildSingleInsertSource(testDataset.getSchema(), 7, "Src 7");
+        ArrowArrayStream streamA = convertToStream(sourceA, allocator)) {
+      txnA =
+          dataset.mergeInsertUncommitted(
+              new MergeInsertParams(Collections.singletonList("id"))
+                  .withMatchedUpdateAll()
+                  .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll),
+              streamA);
+    }
+    try (VectorSchemaRoot sourceB = buildSingleInsertSource(testDataset.getSchema(), 8, "Src 8");
+        ArrowArrayStream streamB = convertToStream(sourceB, allocator)) {
+      txnB =
+          dataset.mergeInsertUncommitted(
+              new MergeInsertParams(Collections.singletonList("id"))
+                  .withMatchedUpdateAll()
+                  .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll),
+              streamB);
+    }
+
+    Assertions.assertNotNull(txnA);
+    Assertions.assertNotNull(txnB);
+    Assertions.assertTrue(txnA.length > 0 && txnB.length > 0, "transactions must be non-empty");
+
+    // Driver: combine + commit both at once.
+    Dataset merged = dataset.commitMergeTransactions(new byte[][] {txnA, txnB});
+
+    Assertions.assertEquals(
+        "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4, 7=Src 7, 8=Src 8}",
+        readAll(merged).toString(),
+        "both uncommitted inserts must be present after the single combined commit");
+  }
+
+  private VectorSchemaRoot buildSingleInsertSource(Schema schema, int id, String name) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+    ((IntVector) root.getVector("id")).setSafe(0, id);
+    ((VarCharVector) root.getVector("name")).setSafe(0, name.getBytes(StandardCharsets.UTF_8));
+    root.setRowCount(1);
+    return root;
+  }
+
+  @Test
   public void testMergeInsertWithoutIndex() throws Exception {
     // Verify that merge insert with useIndex=false still completes and
     // produces results consistent with the default (useIndex=true).
