@@ -2101,6 +2101,30 @@ pub struct UncommittedMergeInsert {
 ///
 /// All input transactions must be `Operation::Update` with the same
 /// `read_version`; otherwise an error is returned.
+///
+/// # Required invariant: the source must be partitioned by merge key
+///
+/// This function assumes each input transaction's source was a disjoint slice of
+/// the merge keys — i.e. the caller hash-partitioned the source by the `on`
+/// columns before running the per-partition merges. Under that invariant a given
+/// target row is matched (and deleted) by at most one transaction, so the
+/// deletion-vector union is unambiguous. The connector
+/// (`LanceNativeMergeExec`) guarantees this by repartitioning the source by the
+/// merge key.
+///
+/// If two transactions delete the SAME physical target row (which can only happen
+/// when the source was NOT key-partitioned — the same key reached two
+/// partitions), this errors rather than silently committing both partitions'
+/// new rows for that key (which would duplicate the key). Note that
+/// [`SourceDedupeBehavior::FirstSeen`] only resolves duplicates WITHIN a single
+/// partition's merge; it has no cross-partition meaning here.
+///
+/// TODO(follow-up): support `FirstSeen` across partitions by, on a same-row
+/// collision, keeping one transaction's new row and masking the colliding key in
+/// the other transaction's already-written new fragment with a deletion vector.
+/// Deferred because "first" is arbitrary across independently-computed
+/// transactions and the connector's key-partitioning makes the collision
+/// unreachable in practice.
 pub async fn combine_merge_transactions(
     dataset: &Dataset,
     transactions: Vec<Transaction>,
@@ -10426,6 +10450,82 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 "merge-written data file {p} must be referenced verbatim (no rewrite)"
             );
         }
+    }
+
+    /// Safety backstop: if two partitions' merges delete the SAME physical target
+    /// row (i.e. the source was not deduplicated / not partitioned by merge key,
+    /// so the same key reached two partitions), combining their transactions must
+    /// ERROR rather than silently union — otherwise the row's two conflicting new
+    /// values would both be inserted. Here both sources update key 0, so both
+    /// uncommitted merges delete row 0 in fragment A.
+    #[tokio::test]
+    async fn test_combine_rejects_same_row_deleted_twice() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(UInt32Array::from(vec![0, 10, 20])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        let run = |v: u32| {
+            let dataset = dataset.clone();
+            let schema = schema.clone();
+            async move {
+                // Both arms update the SAME key 0 → both delete the same _rowaddr.
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![0])),
+                        Arc::new(UInt32Array::from(vec![v])),
+                    ],
+                )
+                .unwrap();
+                let stream = RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    futures::stream::iter(vec![Ok(batch)]),
+                );
+                MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let unc_a = run(100).await;
+        let unc_b = run(200).await;
+
+        let result = combine_merge_transactions(
+            dataset.as_ref(),
+            vec![unc_a.transaction, unc_b.transaction],
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "combining two merges that delete the same target row must error"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("deleted the same row"),
+            "error should explain the same-row conflict, got: {msg}"
+        );
     }
 
     /// Does combining two independently-executed merges produce UNIQUE `_rowid`s,
