@@ -2117,8 +2117,13 @@ pub async fn combine_merge_transactions(
     let mut removed_fragment_ids: Vec<u64> = Vec::new();
     let mut new_fragments: Vec<Fragment> = Vec::new();
     let mut fields_modified: Vec<u32> = Vec::new();
-    // Merge updated fragments by id; union deletion vectors on collision.
-    let mut updated_by_id: std::collections::BTreeMap<u64, Fragment> = Default::default();
+    // Group every transaction's view of an updated fragment by fragment id. A
+    // non-bucketed target scatters each fragment's keys across all partitions, so
+    // a single fragment is typically modified by *many* transactions. Gather all
+    // variants first (cheap, no I/O), then union each fragment's deletion vectors
+    // exactly once below — rather than re-reading an accumulating union pairwise,
+    // which is quadratic in object-store reads per fragment.
+    let mut grouped: std::collections::BTreeMap<u64, Vec<Fragment>> = Default::default();
 
     for txn in &transactions {
         if txn.read_version != read_version {
@@ -2146,42 +2151,64 @@ pub async fn combine_merge_transactions(
         fields_modified.extend(fm.iter().copied());
 
         for frag in updated_fragments {
-            match updated_by_id.get_mut(&frag.id) {
-                None => {
-                    updated_by_id.insert(frag.id, frag.clone());
-                }
-                Some(existing) => {
-                    // Shared fragment: union the two deletion bitmaps.
-                    let a = read_fragment_deletions(dataset, existing).await?;
-                    let b = read_fragment_deletions(dataset, frag).await?;
-                    if !a.is_disjoint(&b) {
-                        return Err(Error::invalid_input(format!(
-                            "two merge partitions deleted the same row(s) in fragment {} — \
-                             the source is not partitioned by merge key (or not deduplicated)",
-                            frag.id
-                        )));
-                    }
-                    let union = &a | &b;
-                    let dv = DeletionVector::from(union);
-                    existing.deletion_file = write_deletion_file(
-                        &dataset.base,
-                        existing.id,
-                        read_version,
-                        &dv,
-                        dataset.object_store.as_ref(),
-                    )
-                    .await?;
-                }
-            }
+            grouped.entry(frag.id).or_default().push(frag.clone());
         }
     }
+
+    // For each updated fragment, union its deletion vectors in one pass and write
+    // a single merged deletion file. Fragments are independent → process them
+    // concurrently (bounded by the store's I/O parallelism); the per-fragment
+    // reads run concurrently too.
+    let io_parallelism = dataset.object_store.io_parallelism();
+    let updated_fragments: Vec<Fragment> = stream::iter(grouped.into_iter())
+        .map(|(frag_id, variants)| async move {
+            // Single variant → no shared-fragment collision, keep as-is.
+            if variants.len() == 1 {
+                return Ok(variants.into_iter().next().unwrap());
+            }
+            // Read every variant's deletion vector once, concurrently.
+            let bitmaps: Vec<roaring::RoaringBitmap> =
+                stream::iter(variants.iter().map(|f| read_fragment_deletions(dataset, f)))
+                    .buffer_unordered(io_parallelism)
+                    .try_collect()
+                    .await?;
+            // Union all of them, verifying the deleted row sets are disjoint
+            // (overlap ⇒ two partitions deleted the same target row ⇒ source was
+            // not deduplicated / partitioned by merge key).
+            let mut union = roaring::RoaringBitmap::new();
+            for bm in &bitmaps {
+                if !(&union & bm).is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "two merge partitions deleted the same row(s) in fragment {frag_id} — \
+                         the source is not partitioned by merge key (or not deduplicated)"
+                    )));
+                }
+                union |= bm;
+            }
+            // All variants describe the same fragment; take one as base and attach
+            // the merged deletion file.
+            let mut merged = variants.into_iter().next().unwrap();
+            let dv = DeletionVector::from(union);
+            merged.deletion_file = write_deletion_file(
+                &dataset.base,
+                merged.id,
+                read_version,
+                &dv,
+                dataset.object_store.as_ref(),
+            )
+            .await?;
+            Ok::<Fragment, Error>(merged)
+        })
+        .buffer_unordered(io_parallelism)
+        .try_collect()
+        .await?;
 
     fields_modified.sort_unstable();
     fields_modified.dedup();
 
     let operation = Operation::Update {
         removed_fragment_ids,
-        updated_fragments: updated_by_id.into_values().collect(),
+        updated_fragments,
         new_fragments,
         fields_modified,
         merged_generations: Vec::new(),

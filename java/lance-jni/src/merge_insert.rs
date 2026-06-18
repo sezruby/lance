@@ -163,8 +163,17 @@ fn inner_commit_merge_transactions<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&jdataset, NATIVE_DATASET)? };
         let base = Arc::new(dataset.clone().inner);
         RT.block_on(async move {
+            let t_combine = std::time::Instant::now();
             let combined = combine_merge_transactions(base.as_ref(), transactions).await?;
-            CommitBuilder::new(base).execute(combined).await
+            let combine_ms = t_combine.elapsed().as_millis();
+            let t_commit = std::time::Instant::now();
+            let out = CommitBuilder::new(base).execute(combined).await;
+            eprintln!(
+                "[jni-timing] combine={}ms commit={}ms",
+                combine_ms,
+                t_commit.elapsed().as_millis()
+            );
+            out
         })?
     };
 
