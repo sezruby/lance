@@ -1,0 +1,17 @@
+# Mount the whole lance repo into the container so the path-dependency on the
+# `lance` crate (../../rust/lance) and the workspace root Cargo.toml resolve.
+# lance-jni is excluded from the root workspace but builds against it by path.
+#
+# Install a recent protoc (>= 3.15) — the apt protobuf-compiler is too old and
+# rejects proto3 `optional` labels used by substrait/lance protos.
+[build]
+pre-build = [
+    "apt-get update && apt-get install -y curl unzip",
+    "curl -sSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip",
+    "unzip -o /tmp/protoc.zip -d /usr/local",
+    "chmod +x /usr/local/bin/protoc",
+]
+
+[build.env]
+volumes = ["LANCE_REPO_ROOT"]
+passthrough = ["LANCE_REPO_ROOT"]
