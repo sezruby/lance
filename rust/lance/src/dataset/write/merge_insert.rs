@@ -3721,26 +3721,46 @@ mod tests {
         }
     }
 
-    /// Regression test for the join build-side orientation at scale.
+    /// Regression test for the join build-side orientation with a large target.
     ///
-    /// When the target exceeds DataFusion's hash-join collect threshold
-    /// (`hash_join_single_partition_threshold_rows`, 128K), the join is planned
-    /// as `mode=Partitioned`, and the build (left) side is hashed in memory per
-    /// partition. `create_plan` must keep the small source on the build side and
-    /// stream the large target as the probe side; otherwise the entire target is
-    /// materialized per partition, which can exhaust memory on large tables.
+    /// `create_plan` must keep the small source on the hash join's build side
+    /// and stream the large target as the probe side; otherwise the entire
+    /// target is materialized in the hash table, which can exhaust memory on
+    /// large tables.
+    ///
+    /// Covers all four merge shapes, which map to the four hash-join types:
+    ///
+    /// | `insert_not_matched` | `delete_not_matched_by_source` | join type |
+    /// |---|---|---|
+    /// | false | Keep   | Inner (update-only)            |
+    /// | false | Delete | Right (delete unmatched target)|
+    /// | true  | Keep   | Left  (upsert)                 |
+    /// | true  | Delete | Full  (upsert + delete)        |
     ///
     /// The toy-sized plan-snapshot tests above cannot catch a regression here:
-    /// at small scale the join is `mode=CollectLeft` and the optimizer freely
-    /// swaps the sides, so they would still pass with the operands reversed.
-    /// This test exercises the production-representative `Partitioned` plan and
-    /// asserts the target (`LanceRead`) is the right/probe input.
+    /// with a tiny target the optimizer freely swaps the build/probe sides, so
+    /// they would still pass with the operands reversed. This test uses a target
+    /// larger than DataFusion's collect threshold
+    /// (`hash_join_single_partition_threshold_rows`, 128K) so the swap logic
+    /// does not pull the target onto the build side. It asserts the orientation
+    /// (`LanceRead` on the probe/right input), not the partition mode, so it is
+    /// independent of the host core count (which determines `CollectLeft` vs
+    /// `Partitioned`).
+    #[rstest::rstest]
+    #[case::inner(false, WhenNotMatchedBySource::Keep, JoinType::Inner)]
+    #[case::right(false, WhenNotMatchedBySource::Delete, JoinType::Right)]
+    #[case::left(true, WhenNotMatchedBySource::Keep, JoinType::Left)]
+    #[case::full(true, WhenNotMatchedBySource::Delete, JoinType::Full)]
     #[tokio::test]
-    async fn test_plan_keeps_target_on_probe_side_at_scale() {
-        use datafusion::physical_plan::{displayable, joins::HashJoinExec, joins::PartitionMode};
+    async fn test_plan_keeps_target_on_probe_side_at_scale(
+        #[case] insert_not_matched: bool,
+        #[case] delete_by_source: WhenNotMatchedBySource,
+        #[case] expected_join_type: JoinType,
+    ) {
+        use datafusion::physical_plan::{displayable, joins::HashJoinExec};
 
-        // Target with > 128K rows so the target cannot be collected and the
-        // optimizer plans a Partitioned (not CollectLeft) hash join.
+        // Target with > 128K rows so the optimizer's collect/swap logic does not
+        // pull the target onto the build side.
         let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
             .col("value", array::step::<UInt32Type>())
@@ -3748,13 +3768,19 @@ mod tests {
         let data = data.into_reader_rows(RowCount::from(50_000), BatchCount::from(8)); // 400K rows
         let ds = Dataset::write(data, "memory://", None).await.unwrap();
 
-        let job =
+        let mut builder =
             crate::dataset::MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
-                .unwrap()
-                .when_matched(crate::dataset::WhenMatched::UpdateAll)
-                .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
-                .try_build()
                 .unwrap();
+        builder.when_matched(crate::dataset::WhenMatched::UpdateAll);
+        builder.when_not_matched(if insert_not_matched {
+            crate::dataset::WhenNotMatched::InsertAll
+        } else {
+            crate::dataset::WhenNotMatched::DoNothing
+        });
+        if matches!(delete_by_source, WhenNotMatchedBySource::Delete) {
+            builder.when_not_matched_by_source(WhenNotMatchedBySource::Delete);
+        }
+        let job = builder.try_build().unwrap();
 
         // A small source — the side that should be hashed/built.
         let new_data = lance_datagen::gen_batch()
@@ -3786,15 +3812,24 @@ mod tests {
             .downcast_ref::<HashJoinExec>()
             .expect("HashJoinExec");
 
-        // At this scale the join must be Partitioned, not CollectLeft.
+        // Sanity-check that the shape produced the join type we intended to
+        // exercise, so the source-left operand-order mapping stays in sync with
+        // `create_plan_join_type`.
         assert_eq!(
-            hash_join.partition_mode(),
-            &PartitionMode::Partitioned,
-            "expected a Partitioned hash join at scale; plan was:\n{rendered}"
+            hash_join.join_type(),
+            &expected_join_type,
+            "unexpected join type for this merge shape; plan was:\n{rendered}"
         );
 
         // The target scan must be the right (probe) input, not the left (build)
         // input — that is the whole point of building source.join(target).
+        //
+        // This holds regardless of partition mode: with a large target neither
+        // `CollectLeft` (when DataFusion's target_partitions is 1) nor
+        // `Partitioned` (the multi-core default) swaps the target onto the build
+        // side, because the source stream reports no statistics for
+        // `should_swap_join_order` to act on. We assert the orientation rather
+        // than the mode so the test does not depend on the host core count.
         let right_has_lance_scan =
             format!("{}", displayable(hash_join.right().as_ref()).indent(true))
                 .contains("LanceRead");
@@ -10741,12 +10776,6 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let mut sorted = row_ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        println!(
-            "ROWID combine: count={} unique={} ids={:?}",
-            row_ids.len(),
-            sorted.len(),
-            row_ids
-        );
         assert_eq!(
             row_ids.len(),
             sorted.len(),
