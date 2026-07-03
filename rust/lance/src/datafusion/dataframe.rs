@@ -19,6 +19,7 @@ use datafusion::{
 };
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_table::format::Fragment;
 
 use crate::Dataset;
 
@@ -42,6 +43,8 @@ pub struct LanceTableProvider {
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
     ordered: bool,
+    /// When set, restrict the scan to these fragments instead of the whole dataset.
+    fragments: Option<Vec<Fragment>>,
 }
 
 impl LanceTableProvider {
@@ -54,6 +57,33 @@ impl LanceTableProvider {
         with_row_id: bool,
         with_row_addr: bool,
         ordered: bool,
+    ) -> Self {
+        Self::new_with_options(dataset, with_row_id, with_row_addr, ordered, None)
+    }
+
+    /// Build a provider that scans only `fragments` rather than the whole dataset.
+    pub fn new_with_fragments(
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        ordered: bool,
+        fragments: Vec<Fragment>,
+    ) -> Self {
+        Self::new_with_options(
+            dataset,
+            with_row_id,
+            with_row_addr,
+            ordered,
+            Some(fragments),
+        )
+    }
+
+    fn new_with_options(
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        ordered: bool,
+        fragments: Option<Vec<Fragment>>,
     ) -> Self {
         let mut full_schema = Schema::from(dataset.schema());
         let mut row_id_idx = None;
@@ -72,6 +102,7 @@ impl LanceTableProvider {
             row_id_idx,
             row_addr_idx,
             ordered,
+            fragments,
         }
     }
 
@@ -102,6 +133,9 @@ impl TableProvider for LanceTableProvider {
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
+        if let Some(fragments) = &self.fragments {
+            scan.with_fragments(fragments.clone());
+        }
         match projection {
             Some(projection) if projection.is_empty() => {
                 scan.empty_project()?;
@@ -173,6 +207,14 @@ pub trait SessionContextExt {
         with_row_id: bool,
         with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame>;
+    /// Creates a DataFrame for reading only the given fragments of a Lance dataset, without ordering
+    fn read_lance_unordered_fragments(
+        &self,
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        fragments: Vec<Fragment>,
+    ) -> datafusion::common::Result<DataFrame>;
     /// Creates a DataFrame for reading a stream of data
     ///
     /// This dataframe may only be queried once, future queries will fail
@@ -243,6 +285,22 @@ impl SessionContextExt for SessionContext {
             with_row_id,
             with_row_addr,
             false,
+        )))
+    }
+
+    fn read_lance_unordered_fragments(
+        &self,
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        fragments: Vec<Fragment>,
+    ) -> datafusion::common::Result<DataFrame> {
+        self.read_table(Arc::new(LanceTableProvider::new_with_fragments(
+            dataset,
+            with_row_id,
+            with_row_addr,
+            false,
+            fragments,
         )))
     }
 

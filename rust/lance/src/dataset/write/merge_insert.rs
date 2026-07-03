@@ -351,6 +351,15 @@ struct MergeInsertParams {
     source_dedupe_behavior: SourceDedupeBehavior,
     // Number of inner commit retries for manifest version conflicts. Default is 20.
     commit_retries: Option<u32>,
+    // When set, scope the target scan to only these fragment ids instead of the whole
+    // dataset. This lets a distributed merge split the target by fragment across tasks so the
+    // target is read once in total (each task merges the source against its own fragment slice),
+    // rather than every task re-scanning the entire target. Only valid for the matched-only,
+    // WhenNotMatchedBySource::Keep shape: a scoped run must not treat a source key absent from its
+    // fragment slice as an insert or a delete (that key may live in another task's fragment), so
+    // insert_not_matched must be false and delete_not_matched_by_source must be Keep. `None` scans
+    // the whole dataset (the default, unchanged behavior).
+    target_fragments: Option<Vec<u32>>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -471,6 +480,7 @@ impl MergeInsertBuilder {
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
                 commit_retries: None,
+                target_fragments: None,
             },
         })
     }
@@ -569,6 +579,23 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Scope the target scan to only the given fragment ids instead of the whole dataset.
+    ///
+    /// This is the building block for a distributed merge: split the target's fragments across
+    /// tasks and give each task one slice, so the target is read once in total rather than
+    /// re-scanned in full by every task. Each scoped run merges the source against only its
+    /// fragment slice and emits an uncommitted transaction; the per-slice transactions are then
+    /// combined and committed together (see [`combine_merge_transactions`]).
+    ///
+    /// Only valid for the matched-only shape — an unmatched source key must not be treated as an
+    /// insert or a delete, because that key may match a target row in another task's fragment
+    /// slice. [`try_build`](Self::try_build) enforces this: `when_not_matched` must be `DoNothing`
+    /// (no inserts) and `when_not_matched_by_source` must be `Keep` (no source-driven deletes).
+    pub fn try_target_fragments(&mut self, fragment_ids: Vec<u32>) -> &mut Self {
+        self.params.target_fragments = Some(fragment_ids);
+        self
+    }
+
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
         if !self.params.insert_not_matched
@@ -578,6 +605,23 @@ impl MergeInsertBuilder {
             return Err(Error::invalid_input(
                 "The merge insert job is not configured to change the data in any way",
             ));
+        }
+        if self.params.target_fragments.is_some() {
+            // A fragment-scoped run only sees a slice of the target, so it cannot decide inserts
+            // (unmatched-by-source) or source-driven deletes correctly — those require the whole
+            // target. Restrict it to the matched-only shape.
+            if self.params.insert_not_matched {
+                return Err(Error::invalid_input(
+                    "target_fragments is only supported for matched-only merges: \
+                     when_not_matched must be DoNothing (a fragment slice cannot decide inserts)",
+                ));
+            }
+            if self.params.delete_not_matched_by_source != WhenNotMatchedBySource::Keep {
+                return Err(Error::invalid_input(
+                    "target_fragments is only supported with when_not_matched_by_source = Keep \
+                     (a fragment slice cannot decide not-matched-by-source deletes)",
+                ));
+            }
         }
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
@@ -1485,7 +1529,39 @@ impl MergeInsertJob {
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
-        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
+        // When target_fragments is set, scan only that slice of the target so a distributed merge
+        // can split the target across tasks (each reads its own fragments) instead of every task
+        // re-scanning the whole target. try_build() has already restricted this to the matched-only
+        // shape, so a fragment slice never has to decide inserts or not-matched-by-source deletes.
+        let scan = match &self.params.target_fragments {
+            Some(fragment_ids) => {
+                let by_id: std::collections::HashMap<u64, Fragment> = self
+                    .dataset
+                    .fragments()
+                    .iter()
+                    .map(|f| (f.id, f.clone()))
+                    .collect();
+                let fragments = fragment_ids
+                    .iter()
+                    .map(|id| {
+                        by_id.get(&(*id as u64)).cloned().ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "target_fragments references fragment id {} which does not exist \
+                                 in the dataset",
+                                id
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                session_ctx.read_lance_unordered_fragments(
+                    self.dataset.clone(),
+                    true,
+                    true,
+                    fragments,
+                )?
+            }
+            None => session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?,
+        };
         // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
         let on_cols = self
             .params
@@ -10592,6 +10668,214 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 "merge-written data file {p} must be referenced verbatim (no rewrite)"
             );
         }
+    }
+
+    /// Core validation for the fragment-scoped merge (the building block for a
+    /// distributed merge that reads the target once instead of N times):
+    ///
+    /// Splitting the target BY FRAGMENT and running a matched-only merge per
+    /// fragment slice against the WHOLE source — then combining + committing the
+    /// per-slice transactions — must produce exactly the same result as a single
+    /// full matched-only merge over the whole target.
+    ///
+    /// This partitioning is disjoint by construction: a slice only ever deletes
+    /// rows in its own fragments, so no two slices can touch the same physical
+    /// target row (a strictly stronger guarantee than key-partitioning). The test
+    /// asserts both the equivalence AND that each slice's transaction only modified
+    /// its assigned fragment (proving the scan was actually scoped).
+    #[tokio::test]
+    async fn test_fragment_scoped_merge_equals_full_merge() {
+        // Two fragments, 3 rows each: keys 0..6, value == key * 10.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let make_dataset = || async {
+            let initial = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                    Arc::new(UInt32Array::from(vec![0, 10, 20, 30, 40, 50])),
+                ],
+            )
+            .unwrap();
+            let dataset = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            Arc::new(dataset)
+        };
+
+        // Source updates keys drawn from BOTH fragments (0,2 in frag 0; 3,5 in
+        // frag 1) so each slice has some matches and some non-matches. New value
+        // == key * 10 + 1 so we can tell updated rows from untouched ones.
+        let source = || {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0, 2, 3, 5])),
+                    Arc::new(UInt32Array::from(vec![1, 21, 31, 51])),
+                ],
+            )
+            .unwrap()
+        };
+        let source_stream = || {
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(vec![Ok(source())]),
+            )) as SendableRecordBatchStream
+        };
+
+        // Read the whole dataset into a sorted (id -> value) map for comparison.
+        let dump = |dataset: Arc<Dataset>| async move {
+            let batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut by_id: std::collections::BTreeMap<u32, u32> = Default::default();
+            for b in &batches {
+                let ids = b.column(0).as_primitive::<UInt32Type>();
+                let vals = b.column(1).as_primitive::<UInt32Type>();
+                for i in 0..b.num_rows() {
+                    assert!(
+                        by_id.insert(ids.value(i), vals.value(i)).is_none(),
+                        "duplicate id {}",
+                        ids.value(i)
+                    );
+                }
+            }
+            by_id
+        };
+
+        // --- Baseline: one full matched-only merge over the whole target. ---
+        let full_ds = make_dataset().await;
+        let (full_ds, _stats) = MergeInsertBuilder::try_new(full_ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute(source_stream())
+            .await
+            .unwrap();
+        let expected = dump(full_ds).await;
+
+        // --- Fragment-scoped: one matched-only merge per fragment slice. ---
+        let split_ds = make_dataset().await;
+        let base_version = split_ds.manifest().version;
+        let frag_ids: Vec<u32> = split_ds
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        assert_eq!(frag_ids.len(), 2, "expected a 2-fragment target");
+
+        let mut per_slice_txns = Vec::new();
+        for frag_id in &frag_ids {
+            let unc = MergeInsertBuilder::try_new(split_ds.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_target_fragments(vec![*frag_id])
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(source_stream())
+                .await
+                .unwrap();
+
+            // Each slice must only have modified ITS OWN fragment — proof the scan
+            // was scoped and the partitioning is disjoint.
+            if let Operation::Update {
+                updated_fragments, ..
+            } = &unc.transaction.operation
+            {
+                for uf in updated_fragments {
+                    assert_eq!(
+                        uf.id, *frag_id as u64,
+                        "slice for fragment {} touched fragment {}",
+                        frag_id, uf.id
+                    );
+                }
+            } else {
+                panic!("expected Operation::Update");
+            }
+            per_slice_txns.push(unc.transaction);
+        }
+
+        let combined = combine_merge_transactions(split_ds.as_ref(), per_slice_txns)
+            .await
+            .unwrap();
+        assert_eq!(combined.read_version, base_version);
+        let committed = Arc::new(
+            CommitBuilder::new(split_ds.clone())
+                .execute(combined)
+                .await
+                .unwrap(),
+        );
+        let actual = dump(committed).await;
+
+        // Equivalence: fragment-split merge == full merge, and the expected values
+        // are exactly the updates (key*10+1 for 0,2,3,5) with the rest untouched.
+        assert_eq!(
+            actual, expected,
+            "fragment-scoped merge must equal full merge"
+        );
+        assert_eq!(
+            actual,
+            std::collections::BTreeMap::from(
+                [(0, 1), (1, 10), (2, 21), (3, 31), (4, 40), (5, 51),]
+            ),
+            "matched keys updated, unmatched keys untouched"
+        );
+    }
+
+    /// A fragment-scoped merge is only valid for the matched-only shape. Asking for
+    /// inserts (or not-matched-by-source deletes) alongside target_fragments must
+    /// be rejected at build time, since a fragment slice cannot see the whole
+    /// target to decide those.
+    #[tokio::test]
+    async fn test_fragment_scoped_merge_rejects_insert_shape() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(UInt32Array::from(vec![0, 10, 20])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        let result = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_target_fragments(vec![0])
+            .try_build();
+        let Err(err) = result else {
+            panic!("expected try_build to reject the insert shape with target_fragments");
+        };
+        assert!(
+            err.to_string()
+                .contains("target_fragments is only supported for matched-only"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Safety backstop: if two partitions' merges delete the SAME physical target
