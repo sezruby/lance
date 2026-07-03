@@ -25,6 +25,7 @@ use crate::{
     session::Session,
 };
 
+use super::delete::combine_delete_transactions;
 use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
@@ -469,25 +470,50 @@ impl<'a> CommitBuilder<'a> {
 
     /// Commit a set of transactions as a single new version.
     ///
-    /// <div class="warning">
-    ///   Only works for append transactions right now. Other kinds of transactions
-    ///   will be supported in the future.
-    /// </div>
+    /// All transactions must be the same kind of operation. Two kinds are
+    /// currently supported:
+    ///
+    /// - **Append**: the new fragments are concatenated (trivially
+    ///   conflict-free).
+    /// - **Delete**: the per-transaction [`Operation::Delete`]s are combined via
+    ///   [`combine_delete_transactions`] — deletion vectors are unioned per
+    ///   fragment and whole-fragment deletions are merged. This is the driver
+    ///   side of a distributed / parallel delete, where each task produced a
+    ///   fragment-scoped delete over a disjoint slice
+    ///   (see [`super::DeleteBuilder::with_target_fragments`]).
+    ///
+    /// A batch mixing operation kinds, or containing any other kind, is
+    /// rejected.
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
         if transactions.is_empty() {
             return Err(Error::invalid_input_source(
                 "No transactions to commit".into(),
             ));
         }
+
         if transactions
             .iter()
-            .any(|t| !matches!(t.operation, Operation::Append { .. }))
+            .all(|t| matches!(t.operation, Operation::Append { .. }))
         {
-            return Err(Error::not_supported_source(
-                "Only append transactions are supported in batch commits".into(),
-            ));
+            self.execute_batch_append(transactions).await
+        } else if transactions
+            .iter()
+            .all(|t| matches!(t.operation, Operation::Delete { .. }))
+        {
+            self.execute_batch_delete(transactions).await
+        } else {
+            Err(Error::not_supported_source(
+                "Only batches of all-append or all-delete transactions are supported in batch \
+                 commits"
+                    .into(),
+            ))
         }
+    }
 
+    async fn execute_batch_append(
+        self,
+        transactions: Vec<Transaction>,
+    ) -> Result<BatchCommitResult> {
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
         let merged = Transaction {
@@ -508,6 +534,47 @@ impl<'a> CommitBuilder<'a> {
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
+    }
+
+    async fn execute_batch_delete(
+        self,
+        transactions: Vec<Transaction>,
+    ) -> Result<BatchCommitResult> {
+        // combine_delete_transactions writes any merged deletion files into the
+        // dataset's storage, so it needs a concrete dataset handle. Resolve one
+        // from the destination (opening the URI if necessary).
+        let dataset = self.resolve_dataset().await?;
+        let merged = combine_delete_transactions(dataset.as_ref(), transactions).await?;
+        let committed = self.execute(merged.clone()).await?;
+        Ok(BatchCommitResult {
+            dataset: committed,
+            merged,
+        })
+    }
+
+    /// Resolve the destination to a concrete [`Dataset`], opening it from a URI
+    /// when the builder was constructed from a path rather than a dataset.
+    async fn resolve_dataset(&self) -> Result<Arc<Dataset>> {
+        match &self.dest {
+            WriteDestination::Dataset(dataset) => Ok(dataset.clone()),
+            WriteDestination::Uri(uri) => {
+                let session = self
+                    .session
+                    .clone()
+                    .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
+                    .unwrap_or_default();
+                let dataset = DatasetBuilder::from_uri(uri)
+                    .with_read_params(ReadParams {
+                        store_options: self.store_params.clone(),
+                        commit_handler: self.commit_handler.clone(),
+                        ..Default::default()
+                    })
+                    .with_session(session)
+                    .load()
+                    .await?;
+                Ok(Arc::new(dataset))
+            }
+        }
     }
 }
 
