@@ -15,7 +15,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -284,17 +284,23 @@ struct DeleteData {
 
 impl DeleteJob {
     /// Resolve `target_fragments` ids into the dataset's [`Fragment`] metadata,
-    /// erroring on any id that does not exist. Returns `None` for an unscoped
-    /// (whole-dataset) delete.
+    /// erroring on any id that does not exist or is repeated. Returns `None` for
+    /// an unscoped (whole-dataset) delete.
     fn resolve_target_fragments(&self) -> Result<Option<Vec<Fragment>>> {
         let Some(fragment_ids) = &self.target_fragments else {
             return Ok(None);
         };
         let by_id: BTreeMap<u64, &Fragment> =
             self.dataset.fragments().iter().map(|f| (f.id, f)).collect();
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
         let fragments = fragment_ids
             .iter()
             .map(|id| {
+                if !seen.insert(*id) {
+                    return Err(Error::invalid_input(format!(
+                        "target_fragments contains duplicate fragment id {id}"
+                    )));
+                }
                 by_id.get(&(*id as u64)).map(|f| (*f).clone()).ok_or_else(|| {
                     Error::invalid_input(format!(
                         "target_fragments references fragment id {} which does not exist in the dataset",
@@ -476,42 +482,54 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<DeleteResult> {
     Ok(result)
 }
 
+/// A combined delete produced by [`combine_delete_transactions`], ready to
+/// commit with [`CommitBuilder`].
+#[derive(Debug, Clone)]
+pub struct CombinedDelete {
+    /// The single [`Operation::Delete`] transaction covering every slice.
+    pub transaction: Transaction,
+    /// The row addresses newly tombstoned across all slices, relative to the
+    /// shared `read_version`. Pass to [`CommitBuilder::with_affected_rows`] so a
+    /// concurrent writer can be rebased against at row granularity — matching a
+    /// single [`DeleteBuilder::execute`].
+    pub affected_rows: RowAddrTreeMap,
+    /// Total number of rows deleted across all slices.
+    pub num_deleted_rows: u64,
+}
+
 /// Combine several fragment-scoped [`Operation::Delete`] transactions into a
 /// single delete transaction that can be committed once.
 ///
 /// This is the driver-side step of a distributed / parallel delete: each task
-/// produced an independent [`UncommittedDelete`] over a disjoint slice of the
-/// dataset's fragments (via [`DeleteBuilder::with_target_fragments`] +
+/// produced an independent [`UncommittedDelete`] over a **disjoint** slice of
+/// the dataset's fragments (via [`DeleteBuilder::with_target_fragments`] +
 /// [`DeleteBuilder::execute_uncommitted`]). This function stitches their
-/// [`Operation::Delete`] metadata together — it rewrites at most one small
-/// deletion file per shared fragment and never rewrites data files:
+/// [`Operation::Delete`] metadata into one transaction — it never reads or
+/// rewrites data files, and never rewrites deletion files (each task already
+/// wrote its own fragments' deletion files):
 ///
-/// - `deleted_fragment_ids` (fragments deleted in whole) are unioned.
-/// - `updated_fragments` are grouped by fragment id. A fragment touched by only
-///   one transaction is carried through unchanged. For a fragment touched by
-///   more than one transaction, each variant's deletion vector is read, the
-///   bitmaps are OR-ed together, and a single merged deletion file is written.
+/// - `updated_fragments` from every transaction are concatenated.
+/// - `deleted_fragment_ids` (fragments deleted in whole) are concatenated.
 /// - All input transactions must be [`Operation::Delete`], share the same
 ///   `read_version`, and use the same `predicate`; otherwise an error is
 ///   returned.
 ///
 /// # Disjointness
 ///
-/// When the caller partitions the target's fragments into disjoint slices (the
-/// intended use), each fragment id is modified by at most one transaction, so
-/// the union degenerates to "take the one bitmap" and the combined result is
-/// exactly equal to a single full delete of the same predicate over the whole
-/// dataset. The union code and the overlap check below are a safety backstop
-/// that also makes the invariant explicit: if two transactions did tombstone
-/// the same physical row (only possible if the caller passed overlapping
-/// slices), this errors rather than silently committing.
+/// The slices must be disjoint, so each fragment id is modified by at most one
+/// transaction and the combined result is exactly equal to a single full delete
+/// of the same predicate over the whole dataset. If any fragment id appears in
+/// more than one transaction (only possible if the caller passed overlapping
+/// slices), this errors rather than silently committing — covering both
+/// partially-updated fragments and whole-fragment deletions.
+///
+/// To rebase safely against concurrent writers, [`CombinedDelete::affected_rows`]
+/// is reconstructed by diffing each touched fragment's post-delete deletion
+/// vector against its state at `read_version`.
 pub async fn combine_delete_transactions(
     dataset: &Dataset,
     transactions: Vec<Transaction>,
-) -> Result<Transaction> {
-    use lance_core::utils::deletion::DeletionVector;
-    use lance_table::io::deletion::write_deletion_file;
-
+) -> Result<CombinedDelete> {
     if transactions.is_empty() {
         return Err(Error::invalid_input(
             "combine_delete_transactions requires at least one transaction".to_string(),
@@ -520,10 +538,12 @@ pub async fn combine_delete_transactions(
 
     let read_version = transactions[0].read_version;
     let mut combined_predicate: Option<String> = None;
+    let mut updated_fragments: Vec<Fragment> = Vec::new();
     let mut deleted_fragment_ids: Vec<u64> = Vec::new();
-    // Group every transaction's view of an updated fragment by fragment id, then
-    // union each fragment's deletion vectors exactly once below.
-    let mut grouped: BTreeMap<u64, Vec<Fragment>> = BTreeMap::new();
+    // Every fragment id seen so far, to enforce disjointness across slices. A
+    // fragment appearing twice (whether updated or wholly deleted) means the
+    // caller passed overlapping slices.
+    let mut seen_fragment_ids: BTreeMap<u64, ()> = BTreeMap::new();
 
     for txn in &transactions {
         if txn.read_version != read_version {
@@ -533,8 +553,8 @@ pub async fn combine_delete_transactions(
             )));
         }
         let Operation::Delete {
-            updated_fragments,
-            deleted_fragment_ids: deleted_ids,
+            updated_fragments: txn_updated,
+            deleted_fragment_ids: txn_deleted,
             predicate,
         } = &txn.operation
         else {
@@ -555,72 +575,111 @@ pub async fn combine_delete_transactions(
             None => combined_predicate = Some(predicate.clone()),
         }
 
-        deleted_fragment_ids.extend(deleted_ids.iter().copied());
-        for frag in updated_fragments {
-            grouped.entry(frag.id).or_default().push(frag.clone());
+        for id in txn_updated
+            .iter()
+            .map(|f| f.id)
+            .chain(txn_deleted.iter().copied())
+        {
+            if seen_fragment_ids.insert(id, ()).is_some() {
+                return Err(Error::invalid_input(format!(
+                    "two delete transactions both modified fragment {id} — the fragment slices \
+                     passed to with_target_fragments are not disjoint"
+                )));
+            }
         }
+
+        updated_fragments.extend(txn_updated.iter().cloned());
+        deleted_fragment_ids.extend(txn_deleted.iter().copied());
     }
 
-    deleted_fragment_ids.sort_unstable();
-    deleted_fragment_ids.dedup();
-
-    // For each updated fragment, union its deletion vectors in one pass and write
-    // a single merged deletion file. Fragments are independent → process them
-    // concurrently (bounded by the store's I/O parallelism).
-    let io_parallelism = dataset.object_store.io_parallelism();
-    let mut updated_fragments: Vec<Fragment> = futures::stream::iter(grouped.into_iter())
-        .map(|(frag_id, variants)| async move {
-            // Single variant → no shared-fragment collision, keep as-is.
-            if variants.len() == 1 {
-                return Ok(variants.into_iter().next().unwrap());
-            }
-            // Read every variant's deletion vector once, concurrently.
-            let bitmaps: Vec<roaring::RoaringBitmap> =
-                futures::stream::iter(variants.iter().map(|f| read_fragment_deletions(dataset, f)))
-                    .buffer_unordered(io_parallelism)
-                    .try_collect()
-                    .await?;
-            // Union all of them, verifying the deleted row sets are disjoint. An
-            // overlap means the caller passed overlapping fragment slices to two
-            // tasks (each tombstoned the same physical row), which the distributed
-            // flow guarantees never happens.
-            let mut union = roaring::RoaringBitmap::new();
-            for bm in &bitmaps {
-                if !(&union & bm).is_empty() {
-                    return Err(Error::invalid_input(format!(
-                        "two delete transactions tombstoned the same row(s) in fragment {frag_id} — \
-                         the fragment slices passed to with_target_fragments are not disjoint"
-                    )));
-                }
-                union |= bm;
-            }
-            // All variants describe the same fragment; take one as base and attach
-            // the merged deletion file.
-            let mut merged = variants.into_iter().next().unwrap();
-            let dv = DeletionVector::from(union);
-            merged.deletion_file = write_deletion_file(
-                &dataset.base,
-                merged.id,
-                read_version,
-                &dv,
-                dataset.object_store.as_ref(),
-            )
-            .await?;
-            Ok::<Fragment, Error>(merged)
-        })
-        .buffer_unordered(io_parallelism)
-        .try_collect()
-        .await?;
-
+    // Deterministic ordering for the committed transaction.
     updated_fragments.sort_unstable_by_key(|f| f.id);
+    deleted_fragment_ids.sort_unstable();
+
+    // Reconstruct the newly-deleted row addresses (delta vs read_version) so the
+    // batch commit can rebase against a concurrent writer at row granularity,
+    // just as a single delete does. This reads deletion files only; data files
+    // are untouched. `predicate` is guaranteed Some (non-empty input checked
+    // above); a missing predicate is a programming error.
+    let predicate = combined_predicate
+        .ok_or_else(|| Error::internal("combined delete produced no predicate".to_string()))?;
+    let (affected_rows, num_deleted_rows) = delete_delta_affected_rows(
+        dataset,
+        read_version,
+        &updated_fragments,
+        &deleted_fragment_ids,
+    )
+    .await?;
 
     let operation = Operation::Delete {
         updated_fragments,
         deleted_fragment_ids,
-        predicate: combined_predicate.unwrap_or_default(),
+        predicate,
     };
 
-    Ok(Transaction::new(read_version, operation, None))
+    Ok(CombinedDelete {
+        transaction: Transaction::new(read_version, operation, None),
+        affected_rows,
+        num_deleted_rows,
+    })
+}
+
+/// Compute the row addresses newly tombstoned by a combined delete, relative to
+/// `read_version`: for each updated fragment, the post-delete deletion vector
+/// minus the deletions that already existed at `read_version`; for each
+/// wholly-deleted fragment, all of its still-live rows at `read_version`.
+async fn delete_delta_affected_rows(
+    dataset: &Dataset,
+    read_version: u64,
+    updated_fragments: &[Fragment],
+    deleted_fragment_ids: &[u64],
+) -> Result<(RowAddrTreeMap, u64)> {
+    let base = dataset.checkout_version(read_version).await?;
+    let base = &base;
+    let base_by_id: BTreeMap<u64, &Fragment> = base.fragments().iter().map(|f| (f.id, f)).collect();
+    let base_by_id = &base_by_id;
+    let io_parallelism = dataset.object_store.io_parallelism();
+
+    // Per-fragment newly-deleted bitmaps, computed concurrently (I/O bound).
+    let per_fragment: Vec<(u32, roaring::RoaringBitmap)> = futures::stream::iter(
+        updated_fragments
+            .iter()
+            .map(|f| (f.id, Some(f)))
+            .chain(deleted_fragment_ids.iter().map(|id| (*id, None))),
+    )
+    .map(|(frag_id, updated)| {
+        let base_fragment = base_by_id.get(&frag_id).copied();
+        async move {
+            let before = match base_fragment {
+                Some(bf) => read_fragment_deletions(base, bf).await?,
+                // Fragment not present at read_version: nothing was deleted before.
+                None => roaring::RoaringBitmap::new(),
+            };
+            let after = match updated {
+                // Partial delete: read the fragment's post-delete deletion vector.
+                Some(f) => read_fragment_deletions(dataset, f).await?,
+                // Whole-fragment delete: every physical row is now tombstoned.
+                None => match base_fragment.and_then(|bf| bf.physical_rows) {
+                    Some(rows) => (0..rows as u32).collect(),
+                    None => roaring::RoaringBitmap::new(),
+                },
+            };
+            Ok::<_, Error>((frag_id as u32, after - before))
+        }
+    })
+    .buffer_unordered(io_parallelism)
+    .try_collect()
+    .await?;
+
+    let mut affected_rows = RowAddrTreeMap::new();
+    let mut num_deleted_rows: u64 = 0;
+    for (frag_id, bitmap) in per_fragment {
+        num_deleted_rows += bitmap.len();
+        if !bitmap.is_empty() {
+            affected_rows.insert_bitmap(frag_id, bitmap);
+        }
+    }
+    Ok((affected_rows, num_deleted_rows))
 }
 
 /// Read a fragment's deletion vector as a `RoaringBitmap` (empty if none).
@@ -655,6 +714,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_select::mask::RowSetOps;
     use rstest::rstest;
     use std::collections::HashSet;
     use std::ops::Range;
@@ -1367,7 +1427,7 @@ mod tests {
         // Baseline: full delete over the whole dataset.
         let baseline_dir = TempStrDir::default();
         let mut baseline = make_multi_fragment_dataset(baseline_dir.as_str(), 4).await;
-        baseline.delete(predicate).await.unwrap();
+        let baseline_deleted = baseline.delete(predicate).await.unwrap().num_deleted_rows;
         let expected_ids = surviving_ids(&baseline).await;
 
         // Split: partition the 4 fragments into 2 disjoint slices, delete each
@@ -1396,6 +1456,18 @@ mod tests {
             }
             transactions.push(staged.transaction);
         }
+
+        // The combiner reconstructs the same total row count and affected-row
+        // set as the single full delete.
+        let combined = combine_delete_transactions(dataset.as_ref(), transactions.clone())
+            .await
+            .unwrap();
+        assert_eq!(combined.num_deleted_rows, baseline_deleted);
+        assert_eq!(
+            combined.affected_rows.len(),
+            Some(baseline_deleted),
+            "affected_rows should cover exactly the deleted rows"
+        );
 
         let result = CommitBuilder::new(dataset.clone())
             .execute_batch(transactions)
@@ -1531,22 +1603,37 @@ mod tests {
         );
     }
 
+    /// Assert an error is `InvalidInput` and its message contains `needle`, so
+    /// the test distinguishes *which* invariant fired (all guards here map to
+    /// the same `InvalidInput` variant).
+    fn assert_invalid_input_contains(err: &Result<impl std::fmt::Debug>, needle: &str) {
+        match err {
+            Err(Error::InvalidInput { source, .. }) => {
+                let msg = source.to_string();
+                assert!(
+                    msg.contains(needle),
+                    "expected InvalidInput message containing {needle:?}, got {msg:?}"
+                );
+            }
+            other => panic!("expected InvalidInput containing {needle:?}, got {other:?}"),
+        }
+    }
+
     /// combine_delete_transactions rejects transactions whose fragment slices
-    /// overlap (two tasks tombstoned the same physical row).
+    /// overlap (two tasks both modified the same fragment).
     #[tokio::test]
     async fn test_combine_delete_rejects_overlapping_slices() {
         let tmp_dir = TempStrDir::default();
         let dataset = Arc::new(make_multi_fragment_dataset(tmp_dir.as_str(), 2).await);
         let ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
 
-        // Two independent deletes of DIFFERENT rows in the SAME fragment 0.
+        // Both slices target the SAME fragment 0 (overlapping slices), which the
+        // combiner must reject before ever touching deletion vectors.
         let staged_a = DeleteBuilder::new(dataset.clone(), "i < 10")
             .with_target_fragments(vec![ids[0]])
             .execute_uncommitted()
             .await
             .unwrap();
-        // Same predicate is required by the combiner; use a predicate that also
-        // touches fragment 0 but a disjoint row range so the union is exercised.
         let staged_b = DeleteBuilder::new(dataset.clone(), "i < 10")
             .with_target_fragments(vec![ids[0]])
             .execute_uncommitted()
@@ -1558,10 +1645,42 @@ mod tests {
             vec![staged_a.transaction, staged_b.transaction],
         )
         .await;
-        assert!(
-            matches!(&err, Err(Error::InvalidInput { .. })),
-            "expected overlap rejection, got {err:?}"
-        );
+        assert_invalid_input_contains(&err, "not disjoint");
+    }
+
+    /// combine_delete_transactions rejects overlapping WHOLE-fragment deletions
+    /// (same fragment id in two transactions' deleted_fragment_ids), not just
+    /// overlapping partial updates.
+    #[tokio::test]
+    async fn test_combine_delete_rejects_overlapping_whole_fragment() {
+        let tmp_dir = TempStrDir::default();
+        let dataset = Arc::new(make_multi_fragment_dataset(tmp_dir.as_str(), 2).await);
+        let ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+
+        // "i < 100" deletes ALL of fragment 0, so both staged deletes put
+        // fragment 0 in deleted_fragment_ids (empty updated_fragments).
+        let staged_a = DeleteBuilder::new(dataset.clone(), "i < 100")
+            .with_target_fragments(vec![ids[0]])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let staged_b = DeleteBuilder::new(dataset.clone(), "i < 100")
+            .with_target_fragments(vec![ids[0]])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        assert!(matches!(
+            &staged_a.transaction.operation,
+            Operation::Delete { updated_fragments, deleted_fragment_ids, .. }
+                if updated_fragments.is_empty() && deleted_fragment_ids == &[ids[0] as u64]
+        ));
+
+        let err = combine_delete_transactions(
+            dataset.as_ref(),
+            vec![staged_a.transaction, staged_b.transaction],
+        )
+        .await;
+        assert_invalid_input_contains(&err, "not disjoint");
     }
 
     /// combine_delete_transactions rejects a mix of predicates.
@@ -1587,10 +1706,21 @@ mod tests {
             vec![staged_a.transaction, staged_b.transaction],
         )
         .await;
-        assert!(
-            matches!(&err, Err(Error::InvalidInput { .. })),
-            "expected predicate-mismatch rejection, got {err:?}"
-        );
+        assert_invalid_input_contains(&err, "same predicate");
+    }
+
+    /// with_target_fragments rejects a repeated fragment id.
+    #[tokio::test]
+    async fn test_fragment_scoped_delete_duplicate_id_errors() {
+        let tmp_dir = TempStrDir::default();
+        let dataset = Arc::new(make_multi_fragment_dataset(tmp_dir.as_str(), 2).await);
+        let ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+
+        let err = DeleteBuilder::new(dataset, "i < 10")
+            .with_target_fragments(vec![ids[0], ids[0]])
+            .execute_uncommitted()
+            .await;
+        assert_invalid_input_contains(&err, "duplicate fragment id");
     }
 
     /// execute_batch rejects a batch that mixes operation kinds.
@@ -1618,7 +1748,7 @@ mod tests {
             .await
             .err();
         assert!(
-            matches!(err, Some(Error::NotSupported { .. })),
+            matches!(&err, Some(Error::NotSupported { .. })),
             "expected NotSupported for mixed batch, got {err:?}"
         );
     }
@@ -1667,6 +1797,16 @@ mod tests {
         let expected: Vec<u32> = (0..400).filter(|v| v % 2 == 1).collect();
         assert_eq!(surviving_ids(&committed).await, expected);
 
+        // The scalar index survives the distributed delete and still covers the
+        // dataset: statistics report the post-delete live-row count with nothing
+        // left unindexed. (A filtered count alone would pass even if the index
+        // were dropped, since the scanner falls back to a full scan.)
+        let stats: serde_json::Value =
+            serde_json::from_str(&committed.index_statistics("scalar_index").await.unwrap())
+                .unwrap();
+        assert_eq!(stats["num_indexed_rows"].as_u64(), Some(200));
+        assert_eq!(stats["num_unindexed_rows"].as_u64(), Some(0));
+
         // An indexed lookup of a deleted value returns nothing; a surviving one
         // returns exactly one row.
         let mut deleted_scan = committed.scan();
@@ -1676,5 +1816,53 @@ mod tests {
         let mut surviving_scan = committed.scan();
         surviving_scan.filter("i = 3").unwrap();
         assert_eq!(surviving_scan.count_rows().await.unwrap(), 1);
+    }
+
+    /// A batched distributed delete rebases against a concurrent delete that
+    /// touched a different fragment, thanks to the reconstructed affected_rows —
+    /// matching a single delete's row-level conflict handling.
+    #[tokio::test]
+    async fn test_batch_delete_rebases_against_concurrent_delete() {
+        let tmp_dir = TempStrDir::default();
+        let dataset = Arc::new(make_multi_fragment_dataset(tmp_dir.as_str(), 3).await);
+        let ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+
+        // Stage a distributed delete over fragments 0 and 1 at the current
+        // version.
+        let mut transactions = Vec::new();
+        for id in [ids[0], ids[1]] {
+            let staged = DeleteBuilder::new(dataset.clone(), "i % 2 = 0")
+                .with_target_fragments(vec![id])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            transactions.push(staged.transaction);
+        }
+
+        // A concurrent delete commits first, tombstoning rows in fragment 2 (a
+        // fragment the staged batch does NOT touch). This advances the version,
+        // so the batch commit must rebase rather than fail.
+        DeleteBuilder::new(dataset.clone(), "i >= 250 AND i < 260")
+            .execute()
+            .await
+            .unwrap();
+
+        // The batch commit carries affected_rows, so it rebases onto the new
+        // version and succeeds (a None affected_rows would hard-fail here).
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute_batch(transactions)
+            .await
+            .unwrap()
+            .dataset;
+        committed.validate().await.unwrap();
+
+        // Both deletes applied: even i in [0,200) gone (distributed), 250..260
+        // gone (concurrent).
+        let expected: Vec<u32> = (0..200)
+            .filter(|v| v % 2 == 1)
+            .chain(200..250)
+            .chain(260..300)
+            .collect();
+        assert_eq!(surviving_ids(&committed).await, expected);
     }
 }

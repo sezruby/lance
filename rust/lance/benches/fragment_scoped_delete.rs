@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use futures::future::try_join_all;
 use lance::dataset::write::DeleteBuilder;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
@@ -122,33 +122,51 @@ fn fragment_slices(ds: &Dataset) -> Vec<Vec<u32>> {
     slices
 }
 
+/// Build a fresh target in its own temp dir. Returned as the (untimed) per-
+/// iteration setup so each timed round starts from a clean store: an
+/// uncommitted delete still WRITES per-fragment deletion files to storage, and
+/// reusing one dataset would let those files accumulate across iterations and
+/// bias the full-scan mode (which writes NUM_TASKS× as many) more than the
+/// scoped mode. The TempStrDir is returned alongside the dataset so it stays
+/// alive during the timed round and is dropped (cleaning the files) after it.
+fn fresh_target(rt: &tokio::runtime::Runtime) -> (TempStrDir, Arc<Dataset>, Vec<Vec<u32>>) {
+    let dir = TempStrDir::default();
+    let ds = Arc::new(rt.block_on(build_base(dir.as_str())));
+    let slices = fragment_slices(&ds);
+    (dir, ds, slices)
+}
+
 fn bench_fragment_scoped_delete(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let dir = TempStrDir::default();
-    let path = dir.as_str().to_string();
-    let ds = Arc::new(rt.block_on(build_base(&path)));
-    let slices = fragment_slices(&ds);
 
     // Baseline: every task scans the whole target → O(NUM_TASKS * target).
     c.bench_function("fragment_scoped_delete/full_scan_per_task", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let futs = (0..NUM_TASKS).map(|_| full_scan_task(ds.clone()));
-                try_join_all(futs.map(tokio::spawn)).await.unwrap();
-            })
-        })
+        b.iter_batched(
+            || fresh_target(&rt),
+            |(_dir, ds, _slices)| {
+                rt.block_on(async {
+                    let futs = (0..NUM_TASKS).map(|_| full_scan_task(ds.clone()));
+                    try_join_all(futs.map(tokio::spawn)).await.unwrap();
+                })
+            },
+            BatchSize::PerIteration,
+        )
     });
 
     // Optimization: each task scans only its fragment slice → O(target) total.
     c.bench_function("fragment_scoped_delete/fragment_scoped_per_task", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let futs = slices
-                    .iter()
-                    .map(|slice| fragment_scoped_task(ds.clone(), slice.clone()));
-                try_join_all(futs.map(tokio::spawn)).await.unwrap();
-            })
-        })
+        b.iter_batched(
+            || fresh_target(&rt),
+            |(_dir, ds, slices)| {
+                rt.block_on(async {
+                    let futs = slices
+                        .iter()
+                        .map(|slice| fragment_scoped_task(ds.clone(), slice.clone()));
+                    try_join_all(futs.map(tokio::spawn)).await.unwrap();
+                })
+            },
+            BatchSize::PerIteration,
+        )
     });
 }
 

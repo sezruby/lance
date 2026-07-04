@@ -4641,9 +4641,10 @@ class LanceDataset(pa.dataset.Dataset):
             file metadata cache.
         transactions: Iterable[Transaction]
             The transactions to apply to the dataset. These will be merged into
-            a single transaction and applied to the dataset. Note: Only append
-            transactions are currently supported. Other transaction types will be
-            supported in the future.
+            a single transaction and applied to the dataset. All transactions
+            must be the same kind of operation: either all appends, or all
+            deletes (the driver side of a distributed / parallel delete). Other
+            transaction types are not yet supported.
         commit_lock : CommitLock, optional
             A custom commit lock.  Only needed if your object store does not support
             atomic commits.  See the user guide for more details.
