@@ -64,7 +64,9 @@ pub mod update;
 
 pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
-pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
+pub use delete::{
+    CombinedDelete, DeleteBuilder, DeleteResult, UncommittedDelete, combine_delete_transactions,
+};
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.

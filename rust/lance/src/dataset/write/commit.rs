@@ -25,6 +25,7 @@ use crate::{
     session::Session,
 };
 
+use super::delete::combine_delete_transactions;
 use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
@@ -469,25 +470,82 @@ impl<'a> CommitBuilder<'a> {
 
     /// Commit a set of transactions as a single new version.
     ///
-    /// <div class="warning">
-    ///   Only works for append transactions right now. Other kinds of transactions
-    ///   will be supported in the future.
-    /// </div>
+    /// All transactions must be the same kind of operation. Two kinds are
+    /// currently supported:
+    ///
+    /// - **Append**: the new fragments are concatenated (trivially
+    ///   conflict-free).
+    /// - **Delete**: the per-transaction [`Operation::Delete`]s are combined via
+    ///   [`combine_delete_transactions`] into one delete. This is the driver
+    ///   side of a distributed / parallel delete, where each task produced a
+    ///   fragment-scoped delete over a disjoint slice
+    ///   (see [`super::DeleteBuilder::with_target_fragments`]). The combined
+    ///   delete carries reconstructed `affected_rows`, so it rebases against a
+    ///   concurrent writer at row granularity just like a single delete.
+    ///
+    /// A batch mixing operation kinds, or containing any other kind, is
+    /// rejected.
+    ///
+    /// The configured [`Self::with_timeout`] bounds the entire call, including
+    /// the delete path's dataset resolution and deletion-file reads.
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
         if transactions.is_empty() {
             return Err(Error::invalid_input_source(
                 "No transactions to commit".into(),
             ));
         }
-        if transactions
-            .iter()
-            .any(|t| !matches!(t.operation, Operation::Append { .. }))
+        let timeout = self.timeout;
+        if let Some(t) = timeout
+            && t.is_zero()
         {
-            return Err(Error::not_supported_source(
-                "Only append transactions are supported in batch commits".into(),
+            return Err(Error::invalid_input(
+                "CommitBuilder timeout must be non-zero; pass `None` to disable",
             ));
         }
+        // Box so wrapping in `tokio::time::Timeout` does not deepen the future
+        // type (see `execute`). The timeout covers the whole batch, unlike a
+        // per-`execute` timeout that would miss the delete path's pre-commit I/O.
+        let fut = Box::pin(self.execute_batch_inner(transactions));
+        match timeout {
+            Some(t) => match tokio::time::timeout(t, fut).await {
+                Ok(res) => res,
+                Err(_) => Err(Error::timeout(format!(
+                    "Commit timed out after {:?}. Increase the timeout via \
+                     CommitBuilder::with_timeout or pass `None` to disable.",
+                    t
+                ))),
+            },
+            None => fut.await,
+        }
+    }
 
+    async fn execute_batch_inner(
+        self,
+        transactions: Vec<Transaction>,
+    ) -> Result<BatchCommitResult> {
+        if transactions
+            .iter()
+            .all(|t| matches!(t.operation, Operation::Append { .. }))
+        {
+            self.execute_batch_append(transactions).await
+        } else if transactions
+            .iter()
+            .all(|t| matches!(t.operation, Operation::Delete { .. }))
+        {
+            self.execute_batch_delete(transactions).await
+        } else {
+            Err(Error::not_supported_source(
+                "Only batches of all-append or all-delete transactions are supported in batch \
+                 commits"
+                    .into(),
+            ))
+        }
+    }
+
+    async fn execute_batch_append(
+        self,
+        transactions: Vec<Transaction>,
+    ) -> Result<BatchCommitResult> {
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
         let merged = Transaction {
@@ -506,8 +564,57 @@ impl<'a> CommitBuilder<'a> {
             //TODO: handle batch transaction merges in the future
             transaction_properties: None,
         };
-        let dataset = self.execute(merged.clone()).await?;
+        // execute_inner (not execute): the timeout is applied once by
+        // execute_batch around the whole call.
+        let dataset = self.execute_inner(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
+    }
+
+    async fn execute_batch_delete(
+        mut self,
+        transactions: Vec<Transaction>,
+    ) -> Result<BatchCommitResult> {
+        // combine_delete_transactions reads deletion files, so it needs a
+        // concrete dataset handle. Resolve one from the destination (opening the
+        // URI if necessary).
+        let dataset = self.resolve_dataset().await?;
+        let combined = combine_delete_transactions(dataset.as_ref(), transactions).await?;
+        let merged = combined.transaction;
+        // Carry the reconstructed affected rows so a concurrent writer is rebased
+        // at row granularity, matching a single DeleteBuilder::execute.
+        self.affected_rows = Some(combined.affected_rows);
+        // execute_inner (not execute): the timeout is applied once by
+        // execute_batch around the whole call.
+        let committed = self.execute_inner(merged.clone()).await?;
+        Ok(BatchCommitResult {
+            dataset: committed,
+            merged,
+        })
+    }
+
+    /// Resolve the destination to a concrete [`Dataset`], opening it from a URI
+    /// when the builder was constructed from a path rather than a dataset.
+    async fn resolve_dataset(&self) -> Result<Arc<Dataset>> {
+        match &self.dest {
+            WriteDestination::Dataset(dataset) => Ok(dataset.clone()),
+            WriteDestination::Uri(uri) => {
+                let session = self
+                    .session
+                    .clone()
+                    .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
+                    .unwrap_or_default();
+                let dataset = DatasetBuilder::from_uri(uri)
+                    .with_read_params(ReadParams {
+                        store_options: self.store_params.clone(),
+                        commit_handler: self.commit_handler.clone(),
+                        ..Default::default()
+                    })
+                    .with_session(session)
+                    .load()
+                    .await?;
+                Ok(Arc::new(dataset))
+            }
+        }
     }
 }
 
@@ -880,12 +987,35 @@ mod tests {
             .await
             .unwrap();
 
-        let res = CommitBuilder::new(Arc::new(dataset))
+        let dataset = Arc::new(dataset);
+        let res = CommitBuilder::new(dataset.clone())
             .with_timeout(Some(Duration::from_millis(50)))
             .execute_batch(vec![sample_transaction(1)])
             .await;
         let Err(err) = res else {
-            panic!("commit should time out");
+            panic!("append batch commit should time out");
+        };
+        assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
+
+        // The delete path resolves a dataset and reads deletion files before
+        // committing; the timeout must cover that pre-commit work too, not just
+        // execute(). A delete transaction against the throttled store should
+        // still surface a Timeout rather than hanging.
+        let delete_txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::Delete {
+                updated_fragments: Vec::new(),
+                deleted_fragment_ids: Vec::new(),
+                predicate: "i < 5".to_string(),
+            },
+            None,
+        );
+        let res = CommitBuilder::new(dataset)
+            .with_timeout(Some(Duration::from_millis(50)))
+            .execute_batch(vec![delete_txn])
+            .await;
+        let Err(err) = res else {
+            panic!("delete batch commit should time out");
         };
         assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
     }
