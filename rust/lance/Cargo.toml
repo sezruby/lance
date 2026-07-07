@@ -180,10 +180,6 @@ name = "merge_insert"
 harness = false
 
 [[bench]]
-name = "fragment_scoped_merge"
-harness = false
-
-[[bench]]
 name = "scan"
 harness = false
 
