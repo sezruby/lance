@@ -55,6 +55,7 @@ fn build_merge_job(
     let use_index = extract_use_index(env, jparam)?;
     let source_dedupe_behavior = extract_source_dedupe_behavior(env, jparam)?;
     let marked_generations = extract_marked_generations(env, jparam)?;
+    let target_fragments = extract_target_fragments(env, jparam)?;
 
     unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -63,7 +64,8 @@ fn build_merge_job(
             when_not_matched_by_source_str.as_str(),
             when_not_matched_by_source_delete_expr,
         )?;
-        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
+        let mut builder = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?;
+        builder
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
             .when_not_matched_by_source(when_not_matched_by_source)
@@ -72,10 +74,31 @@ fn build_merge_job(
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
             .source_dedupe_behavior(source_dedupe_behavior)
-            .mark_generations_as_merged(marked_generations)
-            .try_build()?;
+            .mark_generations_as_merged(marked_generations);
+        // Empty means "scan the whole dataset" (default); non-empty scopes the target scan.
+        if !target_fragments.is_empty() {
+            builder.try_target_fragments(target_fragments);
+        }
+        let job = builder.try_build()?;
         Ok(job)
     }
+}
+
+/// Read `MergeInsertParams.targetFragments()` (an `int[]`) into a `Vec<u32>`. Empty ⇒ whole-dataset
+/// scan.
+fn extract_target_fragments<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<Vec<u32>> {
+    use jni::objects::JIntArray;
+    let array: JIntArray = env
+        .call_method(jparam, "targetFragments", "()[I", &[])?
+        .l()?
+        .into();
+    let len = env.get_array_length(&array)?;
+    let mut buf = vec![0i32; len as usize];
+    env.get_int_array_region(&array, 0, buf.as_mut_slice())?;
+    Ok(buf.into_iter().map(|v| v as u32).collect())
 }
 
 /// Uncommitted merge insert: runs the merge (writes new data fragments to
