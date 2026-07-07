@@ -41,9 +41,6 @@ public class MergeInsertParams {
   private boolean useIndex = true;
   private SourceDedupeBehavior sourceDedupeBehavior = SourceDedupeBehavior.Fail;
   private List<MergedGeneration> markedGenerations = Collections.emptyList();
-  // When non-empty, scope the target scan to only these fragment ids instead of the whole dataset.
-  // Empty means "scan the whole dataset" (the default). See withTargetFragments.
-  private int[] targetFragments = new int[0];
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -282,40 +279,8 @@ public class MergeInsertParams {
     return this;
   }
 
-  /**
-   * Scope the target scan to only the given fragment ids instead of the whole dataset.
-   *
-   * <p>This is the building block for a distributed merge: split the target's fragments across
-   * tasks and give each task one slice, so the target is read once in total rather than re-scanned
-   * in full by every task. Each scoped run merges the source against only its fragment slice and
-   * emits an uncommitted transaction; the per-slice transactions are then combined and committed
-   * together (see {@link org.lance.Dataset#commitMergeTransactions}).
-   *
-   * <p>Only valid for the matched-only shape — an unmatched source key must not be treated as an
-   * insert or a delete, because that key may match a target row in another task's fragment slice.
-   * The Rust core enforces this: {@code whenNotMatched} must be {@link WhenNotMatched#DoNothing}
-   * (no inserts) and {@code whenNotMatchedBySource} must be {@link WhenNotMatchedBySource#Keep}.
-   *
-   * <p>Empty (the default) scans the whole dataset — unchanged behavior.
-   *
-   * @param fragmentIds the target fragment ids this run should scan
-   * @return This MergeInsertParams instance
-   */
-  public MergeInsertParams withTargetFragments(int[] fragmentIds) {
-    Preconditions.checkNotNull(fragmentIds, "fragmentIds must not be null");
-    this.targetFragments = fragmentIds;
-    return this;
-  }
-
   public List<String> on() {
     return on;
-  }
-
-  /**
-   * The target fragment ids this merge is scoped to, or an empty array to scan the whole dataset.
-   */
-  public int[] targetFragments() {
-    return targetFragments;
   }
 
   public List<MergedGeneration> markedGenerations() {
@@ -401,7 +366,6 @@ public class MergeInsertParams {
         .add("skipAutoCleanup", skipAutoCleanup)
         .add("useIndex", useIndex)
         .add("sourceDedupeBehavior", sourceDedupeBehavior)
-        .add("targetFragments", targetFragments.length)
         .toString();
   }
 

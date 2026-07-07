@@ -93,15 +93,11 @@ async fn build_base(path: &str) -> Dataset {
 /// starting at `base`. New value = id * 10 + 1 so updates are observable.
 fn task_source(base: i64) -> RecordBatch {
     let ids = Int64Array::from_iter_values(base..base + SOURCE_ROWS_PER_TASK as i64);
-    let vals = Int64Array::from_iter_values(
-        (base..base + SOURCE_ROWS_PER_TASK as i64).map(|v| v * 10 + 1),
-    );
+    let vals = Int64Array::from_iter_values((base..base + SOURCE_ROWS_PER_TASK as i64).map(|v| v * 10 + 1));
     RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(vals)]).unwrap()
 }
 
-fn source_reader(
-    base: i64,
-) -> RecordBatchIterator<std::vec::IntoIter<arrow::error::Result<RecordBatch>>> {
+fn source_reader(base: i64) -> RecordBatchIterator<std::vec::IntoIter<arrow::error::Result<RecordBatch>>> {
     RecordBatchIterator::new(vec![Ok(task_source(base))].into_iter(), schema())
 }
 
@@ -163,10 +159,9 @@ fn bench_fragment_scoped_merge(c: &mut Criterion) {
     c.bench_function("fragment_scoped_merge/fragment_scoped_per_task", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let futs = task_bases
-                    .iter()
-                    .zip(slices.iter())
-                    .map(|(&base, slice)| fragment_scoped_task(ds.clone(), base, slice.clone()));
+                let futs = task_bases.iter().zip(slices.iter()).map(|(&base, slice)| {
+                    fragment_scoped_task(ds.clone(), base, slice.clone())
+                });
                 try_join_all(futs.map(tokio::spawn)).await.unwrap();
             })
         })
