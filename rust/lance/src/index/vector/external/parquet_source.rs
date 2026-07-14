@@ -49,12 +49,31 @@ pub struct ParquetVectorSource {
     /// Vector dimension, discovered when the first file's schema is read. Cached
     /// so `dim()` and `iter_batches()` agree.
     dim: usize,
+    /// Global `file_id` of `files[0]`. The encoded rid is
+    /// `((file_id_offset + local_index) << 32) | row_in_file`. Zero for a
+    /// whole-corpus build; for a distributed shard build it is the position of
+    /// this shard's first file in the FULL (sorted) manifest file list, so every
+    /// shard emits globally-consistent rids that merge correctly.
+    file_id_offset: u32,
 }
 
 impl ParquetVectorSource {
     /// Construct a source over `files` reading `vector_column`. Reads each file's
-    /// footer to validate the column type and infer the dimension.
+    /// footer to validate the column type and infer the dimension. Whole-corpus
+    /// build (`file_id_offset = 0`).
     pub async fn try_new(files: Vec<ParquetFileSpec>, vector_column: &str) -> Result<Self> {
+        Self::try_new_with_offset(files, vector_column, 0).await
+    }
+
+    /// Construct a source for a distributed shard. `file_id_offset` is the global
+    /// index of `files[0]` in the full manifest file list; rids are encoded as
+    /// `((file_id_offset + local_index) << 32) | row_in_file` so shards built on
+    /// separate executors carry consistent global file ids and merge correctly.
+    pub async fn try_new_with_offset(
+        files: Vec<ParquetFileSpec>,
+        vector_column: &str,
+        file_id_offset: u32,
+    ) -> Result<Self> {
         if files.is_empty() {
             return Err(Error::invalid_input(
                 "ExternalIvfPqIndex requires at least one parquet file",
@@ -66,6 +85,7 @@ impl ParquetVectorSource {
             files,
             vector_column: vector_column.to_string(),
             dim: first_dim,
+            file_id_offset,
         })
     }
 
@@ -151,6 +171,7 @@ impl ParquetVectorSource {
             self.files.clone(),
             self.vector_column.clone(),
             out_schema.clone(),
+            self.file_id_offset,
         )
         .await?;
 
@@ -634,6 +655,7 @@ async fn collect_rid_annotated_batches(
     files: Vec<ParquetFileSpec>,
     column: String,
     out_schema: SchemaRef,
+    file_id_offset: u32,
 ) -> Result<Vec<RecordBatch>> {
     // Coerce on the way in: List<Float32> rows from Spark/JVM writers get reshaped to
     // FixedSizeListArray so the downstream IvfTransformer / shuffle path sees the schema
@@ -651,7 +673,10 @@ async fn collect_rid_annotated_batches(
     };
 
     let mut out: Vec<RecordBatch> = Vec::new();
-    for (file_id, spec) in files.iter().enumerate() {
+    for (local_id, spec) in files.iter().enumerate() {
+        // Global file id: shard-local position plus the shard's offset in the full
+        // manifest list. Offset 0 for a whole-corpus build.
+        let file_id = file_id_offset as u64 + local_id as u64;
         let builder = open_parquet_async(&spec.file_path).await?;
         let mask = ProjectionMask::columns(builder.parquet_schema(), [column.as_str()]);
         let mut stream = builder
@@ -668,7 +693,7 @@ async fn collect_rid_annotated_batches(
             let n = batch.num_rows();
             let mut rids: Vec<u64> = Vec::with_capacity(n);
             for i in 0..n {
-                rids.push(((file_id as u64) << 32) | (row_in_file + i as u64));
+                rids.push((file_id << 32) | (row_in_file + i as u64));
             }
             let rid_array = Arc::new(UInt64Array::from(rids)) as ArrayRef;
             let raw_vec_col = batch

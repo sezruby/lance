@@ -890,4 +890,92 @@ mod tests {
             }
         }
     }
+
+    /// The distributed build (train once, shard the assign+encode across N groups,
+    /// merge) must produce an index IDENTICAL to building the same rows in one pass.
+    /// This is the local correctness oracle for the Spark distributed build: it
+    /// shares one trained (ivf, pq) across a 1-shard and a 4-shard assembly (kmeans
+    /// is nondeterministic, so both MUST reuse the same quantizers) and asserts
+    /// byte-identical search results — proving that (a) per-shard partition
+    /// assignment + merge reconstructs the whole-corpus index, and (b) the global
+    /// file_id_offset keeps rids consistent so results map to the right (file, row).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_shard_build_matches_single_pass() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        const DIM: usize = 16;
+        const K: usize = 10;
+        const NUM_FILES: usize = 4;
+        const PER_FILE: usize = 300;
+
+        let tmp_data = TempDir::new().unwrap();
+        let files: Vec<ParquetFileSpec> = (0..NUM_FILES)
+            .map(|i| {
+                let p = tmp_data.path().join(format!("f{i}.parquet"));
+                write_random_parquet(&p, PER_FILE, DIM, 100 + i as u64);
+                ParquetFileSpec::of(p.to_str().unwrap())
+            })
+            .collect();
+
+        let params = ExternalIvfPqIndexParams::builder()
+            .num_partitions(4)
+            .num_sub_vectors(4)
+            .num_bits_per_sub_vector(8)
+            .metric(MetricType::L2)
+            .max_iters(10)
+            .sample_rate(80)
+            .rerank_store(params::RerankStore::Sq8)
+            .build();
+
+        // Train ONCE, share across both builds (kmeans is nondeterministic, so two
+        // independent trainings would diverge — the merge invariant is only defined
+        // for a fixed codebook).
+        let src = super::build::_test_source(files.clone(), "vec").await;
+        let trained = super::build::train_quantizers(&src, &params).await.unwrap();
+
+        let out1 = TempDir::new().unwrap();
+        let uuid1 = super::build::build_index_from_shards_local(
+            files.clone(),
+            "vec",
+            out1.path().to_str().unwrap(),
+            params.clone(),
+            /* num_shards */ 1,
+            Some(trained.clone()),
+        )
+        .await
+        .expect("1-shard build");
+
+        let out4 = TempDir::new().unwrap();
+        let uuid4 = super::build::build_index_from_shards_local(
+            files.clone(),
+            "vec",
+            out4.path().to_str().unwrap(),
+            params.clone(),
+            /* num_shards */ 4,
+            Some(trained.clone()),
+        )
+        .await
+        .expect("4-shard build");
+
+        let idx1 = ExternalIvfPqIndex::open(out1.path().join(uuid1.to_string()).to_str().unwrap())
+            .await
+            .expect("open 1-shard");
+        let idx4 = ExternalIvfPqIndex::open(out4.path().join(uuid4.to_string()).to_str().unwrap())
+            .await
+            .expect("open 4-shard");
+
+        // Same queries must return identical (file_path, row_index, distance) top-K.
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..32 {
+            let q: Vec<f32> = (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let r1 = idx1.search(&q, K, 4, 4, None).await.expect("search 1");
+            let r4 = idx4.search(&q, K, 4, 4, None).await.expect("search 4");
+            assert_eq!(r1.len(), r4.len(), "result count differs");
+            for (a, b) in r1.iter().zip(r4.iter()) {
+                assert_eq!(a.file_path, b.file_path, "file_path differs");
+                assert_eq!(a.row_index, b.row_index, "row_index differs");
+                assert!((a.distance - b.distance).abs() < 1e-4, "distance differs");
+            }
+        }
+    }
 }
