@@ -32,6 +32,7 @@
 //! - [`ExternalIvfPqIndexParams`] — kmeans / PQ / metric configuration
 
 mod build;
+pub(crate) mod distributed;
 mod fetch;
 pub(crate) mod manifest;
 pub(crate) mod open;
