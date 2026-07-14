@@ -44,6 +44,11 @@ pub mod types;
 
 pub use params::{ExternalIvfPqIndexParams, RerankStore};
 pub use types::{ParquetFileSpec, ParquetRowKey, RowFilter, SearchResult};
+// Distributed-build entry points (driver train + broadcast, executor shard build,
+// driver merge). Exposed for the JNI/Spark orchestration layer.
+pub use distributed::{
+    BroadcastPayload, build_shard_to_parquet, merge_shards_to_uri, train_broadcast_payload,
+};
 
 use arrow_array::RecordBatch;
 use lance_core::Result;

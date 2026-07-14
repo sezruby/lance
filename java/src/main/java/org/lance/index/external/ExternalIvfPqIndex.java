@@ -198,7 +198,104 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
     }
   }
 
+  // ---- distributed build ----------------------------------------------------
+
+  /**
+   * Distributed-build phase 1 (driver): train the IVF centroids + PQ codebook on a sample of the
+   * whole corpus and return an opaque broadcast payload. Cheap — reads only a training sample
+   * regardless of corpus size. Broadcast the returned bytes to executors and pass them to {@link
+   * #buildShard}.
+   *
+   * @param filePaths the FULL, sorted file list the index will cover (training samples across all).
+   */
+  public static byte[] trainBroadcast(
+      List<String> filePaths, String vectorColumn, ExternalIvfPqIndexParams params) {
+    return nativeTrainBroadcast(
+        filePaths.toArray(new String[0]),
+        vectorColumn,
+        params.getNumPartitions(),
+        params.getNumSubVectors(),
+        params.getNumBitsPerSubVector(),
+        params.getMetric().toRustString(),
+        params.getMaxIters(),
+        params.getSampleRate(),
+        params.getSeed(),
+        params.getRerankStore().toRustString());
+  }
+
+  /**
+   * Distributed-build phase 2 (executor): assign + PQ-encode this shard's {@code shardFiles} using
+   * the broadcast payload, writing the partition-binned output to {@code shardUri}.
+   *
+   * @param fileIdOffset global index of {@code shardFiles.get(0)} in the full sorted file list —
+   *     the rid file_id base for this shard. Rows emit {@code ((fileIdOffset + local) << 32) |
+   *     row}, so shards built on separate executors carry globally-consistent ids and merge
+   *     correctly.
+   */
+  public static void buildShard(
+      byte[] broadcastPayload,
+      List<String> shardFiles,
+      String vectorColumn,
+      int fileIdOffset,
+      String shardUri,
+      ExternalIvfPqIndexParams params) {
+    nativeBuildShard(
+        broadcastPayload,
+        shardFiles.toArray(new String[0]),
+        vectorColumn,
+        fileIdOffset,
+        shardUri,
+        params.getNumPartitions(),
+        params.getNumSubVectors(),
+        params.getNumBitsPerSubVector(),
+        params.getMetric().toRustString(),
+        params.getMaxIters(),
+        params.getSampleRate(),
+        params.getSeed(),
+        params.getRerankStore().toRustString());
+  }
+
+  /**
+   * Distributed-build phase 3 (driver): merge the per-executor shard outputs into the final index
+   * file. {@code indexUri} is the full path to write (e.g. {@code <dir>/<uuid>/index.idx}); the
+   * caller writes {@code manifest.json} alongside.
+   */
+  public static void mergeShards(
+      byte[] broadcastPayload, List<String> shardUris, String vectorColumn, String indexUri) {
+    nativeMergeShards(broadcastPayload, shardUris.toArray(new String[0]), vectorColumn, indexUri);
+  }
+
   // ---- native methods -------------------------------------------------------
+
+  private static native byte[] nativeTrainBroadcast(
+      String[] filePaths,
+      String vectorColumn,
+      int numPartitions,
+      int numSubVectors,
+      int numBitsPerSubVector,
+      String metric,
+      int maxIters,
+      int sampleRate,
+      long seed,
+      String rerankStore);
+
+  private static native void nativeBuildShard(
+      byte[] broadcastPayload,
+      String[] shardFiles,
+      String vectorColumn,
+      int fileIdOffset,
+      String shardUri,
+      int numPartitions,
+      int numSubVectors,
+      int numBitsPerSubVector,
+      String metric,
+      int maxIters,
+      int sampleRate,
+      long seed,
+      String rerankStore);
+
+  private static native void nativeMergeShards(
+      byte[] broadcastPayload, String[] shardUris, String vectorColumn, String indexUri);
 
   private static native String nativeBuild(
       String[] filePaths,

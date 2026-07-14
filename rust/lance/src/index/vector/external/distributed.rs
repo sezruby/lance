@@ -59,6 +59,56 @@ pub struct BroadcastPayload {
 }
 
 impl BroadcastPayload {
+    /// Serialize to a self-describing byte blob for the JNI/broadcast boundary:
+    /// `[u32 metric_len][metric utf8][u64 ivf_len][ivf_pb][u64 pq_len][pq_pb]`,
+    /// all little-endian. Round-trips via [`Self::from_bytes`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let metric = format!("{}", self.metric);
+        let mut out = Vec::with_capacity(4 + metric.len() + 16 + self.ivf_pb.len() + self.pq_pb.len());
+        out.extend_from_slice(&(metric.len() as u32).to_le_bytes());
+        out.extend_from_slice(metric.as_bytes());
+        out.extend_from_slice(&(self.ivf_pb.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.ivf_pb);
+        out.extend_from_slice(&(self.pq_pb.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.pq_pb);
+        out
+    }
+
+    /// Parse a blob produced by [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let err = || Error::index("BroadcastPayload::from_bytes: truncated blob".to_string());
+        let mut pos = 0usize;
+        let take = |pos: &mut usize, n: usize| -> Result<&[u8]> {
+            if *pos + n > bytes.len() {
+                return Err(Error::index(
+                    "BroadcastPayload::from_bytes: truncated blob".to_string(),
+                ));
+            }
+            let s = &bytes[*pos..*pos + n];
+            *pos += n;
+            Ok(s)
+        };
+        let mlen = u32::from_le_bytes(take(&mut pos, 4)?.try_into().map_err(|_| err())?) as usize;
+        let metric_str = std::str::from_utf8(take(&mut pos, mlen)?)
+            .map_err(|e| Error::index(format!("metric utf8: {e}")))?
+            .to_string();
+        let metric = match metric_str.to_ascii_lowercase().as_str() {
+            "l2" => MetricType::L2,
+            "cosine" => MetricType::Cosine,
+            "dot" => MetricType::Dot,
+            other => return Err(Error::index(format!("unknown metric '{other}'"))),
+        };
+        let ilen = u64::from_le_bytes(take(&mut pos, 8)?.try_into().map_err(|_| err())?) as usize;
+        let ivf_pb = take(&mut pos, ilen)?.to_vec();
+        let plen = u64::from_le_bytes(take(&mut pos, 8)?.try_into().map_err(|_| err())?) as usize;
+        let pq_pb = take(&mut pos, plen)?.to_vec();
+        Ok(Self {
+            ivf_pb,
+            pq_pb,
+            metric,
+        })
+    }
+
     /// Decode back into live quantizers on an executor.
     pub fn decode(&self) -> Result<(IvfModel, ProductQuantizer)> {
         let ivf_pb = PbIvf::decode(self.ivf_pb.as_slice())
@@ -153,6 +203,20 @@ pub async fn merge_shards(
         streams,
     )
     .await
+}
+
+/// URI-based wrapper over [`merge_shards`] for the JNI/Spark layer: resolves
+/// `index_uri` into its object store + path internally so callers pass only
+/// strings. `index_uri` is the full path to the `index.idx` to write (the caller
+/// composes `<dir>/<uuid>/index.idx` and writes the manifest alongside).
+pub async fn merge_shards_to_uri(
+    payload: &BroadcastPayload,
+    shard_uris: &[String],
+    vector_column: &str,
+    index_uri: &str,
+) -> Result<()> {
+    let (object_store, index_path) = ObjectStore::from_uri(index_uri).await?;
+    merge_shards(payload, shard_uris, vector_column, &index_path, &object_store).await
 }
 
 // ---- shard parquet I/O -------------------------------------------------------

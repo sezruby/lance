@@ -197,6 +197,195 @@ fn inner_build<'local>(
     Ok(j.into())
 }
 
+// ---- distributed build --------------------------------------------------------
+
+/// Build `ExternalIvfPqIndexParams` from the flat JNI scalar args (shared by the
+/// single-box and distributed build entry points).
+#[allow(clippy::too_many_arguments)]
+fn params_from_args(
+    env: &mut JNIEnv,
+    num_partitions: jint,
+    num_sub_vectors: jint,
+    num_bits_per_sub_vector: jint,
+    metric: JString,
+    max_iters: jint,
+    sample_rate: jint,
+    seed: jlong,
+    rerank_store: JString,
+) -> Result<ExternalIvfPqIndexParams> {
+    let metric_str: String = metric.extract(env)?;
+    let rerank_store_str: String = rerank_store.extract(env)?;
+    Ok(ExternalIvfPqIndexParams::builder()
+        .num_partitions(num_partitions as usize)
+        .num_sub_vectors(num_sub_vectors as usize)
+        .num_bits_per_sub_vector(num_bits_per_sub_vector as usize)
+        .metric(parse_metric(&metric_str)?)
+        .max_iters(max_iters as usize)
+        .sample_rate(sample_rate as usize)
+        .seed(seed as u64)
+        .rerank_store(parse_rerank_store(&rerank_store_str)?)
+        .build())
+}
+
+fn extract_string_array(env: &mut JNIEnv, arr: &JObjectArray) -> Result<Vec<String>> {
+    let n = env.get_array_length(arr)?;
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let s: JString = env.get_object_array_element(arr, i)?.into();
+        out.push(s.extract(env)?);
+    }
+    Ok(out)
+}
+
+/// Driver phase 1: train quantizers on a sample and return the broadcast payload
+/// as a `byte[]` (see `BroadcastPayload::to_bytes`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeTrainBroadcast<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    file_paths: JObjectArray<'local>,
+    vector_column: JString<'local>,
+    num_partitions: jint,
+    num_sub_vectors: jint,
+    num_bits_per_sub_vector: jint,
+    metric: JString<'local>,
+    max_iters: jint,
+    sample_rate: jint,
+    seed: jlong,
+    rerank_store: JString<'local>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>> {
+        let paths = extract_string_array(&mut env, &file_paths)?;
+        let files: Vec<ParquetFileSpec> = paths.into_iter().map(ParquetFileSpec::of).collect();
+        let vector_column_str: String = vector_column.extract(&mut env)?;
+        let params = params_from_args(
+            &mut env,
+            num_partitions,
+            num_sub_vectors,
+            num_bits_per_sub_vector,
+            metric,
+            max_iters,
+            sample_rate,
+            seed,
+            rerank_store,
+        )?;
+        let payload = RT.block_on(async move {
+            lance::index::vector::external::train_broadcast_payload(
+                files,
+                &vector_column_str,
+                &params,
+            )
+            .await
+        })?;
+        Ok(payload.to_bytes())
+    })();
+    match result {
+        Ok(bytes) => env
+            .byte_array_from_slice(&bytes)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Executor phase 2: build one file shard's partition output to `shard_uri` using
+/// the broadcast payload. `file_id_offset` is the global position of this shard's
+/// first file in the full sorted file list.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeBuildShard<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    payload_bytes: JByteArray<'local>,
+    file_paths: JObjectArray<'local>,
+    vector_column: JString<'local>,
+    file_id_offset: jint,
+    shard_uri: JString<'local>,
+    num_partitions: jint,
+    num_sub_vectors: jint,
+    num_bits_per_sub_vector: jint,
+    metric: JString<'local>,
+    max_iters: jint,
+    sample_rate: jint,
+    seed: jlong,
+    rerank_store: JString<'local>,
+) {
+    ok_or_throw_without_return!(env, {
+        (|| -> Result<()> {
+            let payload = payload_from_jbytes(&mut env, &payload_bytes)?;
+            let paths = extract_string_array(&mut env, &file_paths)?;
+            let files: Vec<ParquetFileSpec> = paths.into_iter().map(ParquetFileSpec::of).collect();
+            let vector_column_str: String = vector_column.extract(&mut env)?;
+            let shard_uri_str: String = shard_uri.extract(&mut env)?;
+            let params = params_from_args(
+                &mut env,
+                num_partitions,
+                num_sub_vectors,
+                num_bits_per_sub_vector,
+                metric,
+                max_iters,
+                sample_rate,
+                seed,
+                rerank_store,
+            )?;
+            RT.block_on(async move {
+                lance::index::vector::external::build_shard_to_parquet(
+                    &payload,
+                    files,
+                    &vector_column_str,
+                    file_id_offset as u32,
+                    &params,
+                    &shard_uri_str,
+                )
+                .await
+            })?;
+            Ok(())
+        })()
+    });
+}
+
+/// Driver phase 3: merge shard parquets into `index_uri` (`<dir>/<uuid>/index.idx`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeMergeShards<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    payload_bytes: JByteArray<'local>,
+    shard_uris: JObjectArray<'local>,
+    vector_column: JString<'local>,
+    index_uri: JString<'local>,
+) {
+    ok_or_throw_without_return!(env, {
+        (|| -> Result<()> {
+            let payload = payload_from_jbytes(&mut env, &payload_bytes)?;
+            let uris = extract_string_array(&mut env, &shard_uris)?;
+            let vector_column_str: String = vector_column.extract(&mut env)?;
+            let index_uri_str: String = index_uri.extract(&mut env)?;
+            RT.block_on(async move {
+                lance::index::vector::external::merge_shards_to_uri(
+                    &payload,
+                    &uris,
+                    &vector_column_str,
+                    &index_uri_str,
+                )
+                .await
+            })?;
+            Ok(())
+        })()
+    });
+}
+
+fn payload_from_jbytes(
+    env: &mut JNIEnv,
+    bytes: &JByteArray,
+) -> Result<lance::index::vector::external::BroadcastPayload> {
+    let raw = env.convert_byte_array(bytes)?;
+    Ok(lance::index::vector::external::BroadcastPayload::from_bytes(&raw)?)
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeOpen<'local>(
     mut env: JNIEnv<'local>,
