@@ -20,27 +20,31 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use arrow::compute::concat;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt8Array};
+use futures::TryStreamExt;
 use lance_core::{Error, Result};
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pq::storage::transpose;
 use lance_io::traits::Reader;
 use lance_linalg::distance::MetricType;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-};
-use parquet::file::metadata::PageIndexPolicy;
+use parquet::arrow::arrow_reader::RowSelection;
 
 use super::open::OpenedExternalIndex;
+use super::parquet_source::ParquetMetaCache;
 use super::types::{RowFilter, SearchResult};
 
-/// Top-level search entry point. Heavy lifting is in the helpers; this is the
-/// orchestrator.
+/// Single-query nearest-neighbor search. Thin wrapper over [`search_batch`] —
+/// every interesting bit of work (probe, PQ scoring, per-file refinement) is
+/// already factored out for the batch path. Kept as a public entry point
+/// because callers that only have one query at a time shouldn't be forced to
+/// allocate `Vec<Vec<f32>>` and then unwrap `Vec<Vec<SearchResult>>`.
 pub async fn search(
     opened: &OpenedExternalIndex,
     query: &[f32],
@@ -49,155 +53,320 @@ pub async fn search(
     refine_factor: usize,
     filter: Option<&dyn RowFilter>,
 ) -> Result<Vec<SearchResult>> {
+    let queries = std::slice::from_ref(&query);
+    let mut batch = search_batch(opened, queries, k, nprobes, refine_factor, filter).await?;
+    Ok(batch.pop().unwrap_or_default())
+}
+
+/// Batched nearest-neighbor search. Same probe + PQ-score work per query as
+/// [`search`], but a single unioned per-file refinement read covers every
+/// query's candidates at once. Designed for offline join workloads where many
+/// query vectors land on the same Spark task and share the same source parquet
+/// files.
+///
+/// Wall-clock benefit comes from collapsing N per-query refinement reads (each
+/// pulling ~50 MB of parquet pages from cloud storage at numL=100) into one
+/// read per file per task. Per-query cost falls from `(probe + pq + refine_io)`
+/// to `(probe + pq + refine_io / N)`.
+///
+/// Result vector is in 1:1 correspondence with the input `queries` slice.
+pub async fn search_batch(
+    opened: &OpenedExternalIndex,
+    queries: &[&[f32]],
+    k: usize,
+    nprobes: usize,
+    refine_factor: usize,
+    filter: Option<&dyn RowFilter>,
+) -> Result<Vec<Vec<SearchResult>>> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let batch_seq = QUERY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let t_start = Instant::now();
     let dim = opened.ivf.dimension();
-    if query.len() != dim {
-        return Err(Error::invalid_input(format!(
-            "query dim {} != index dim {dim}",
-            query.len()
-        )));
+    for (qi, q) in queries.iter().enumerate() {
+        if q.len() != dim {
+            return Err(Error::invalid_input(format!(
+                "query[{qi}] dim {} != index dim {dim}",
+                q.len()
+            )));
+        }
     }
     let mt: MetricType = opened.metric;
-
-    // 1. Probe nprobes partitions
-    let query_array = Float32Array::from(query.to_vec());
-    let (part_ids, _part_distances) =
-        opened
-            .ivf
-            .find_partitions(&query_array, nprobes.max(1), opened.metric)?;
-
-    // For L2/Cosine the index stores residual-encoded PQ codes — we'd need to
-    // subtract the partition centroid from the query before PQ scoring. For Dot,
-    // residuals aren't applied. Since the build path computes residuals for
-    // L2/Cosine, mirror that here.
     let centroids = opened
         .ivf
         .centroids_array()
         .ok_or_else(|| Error::index("opened index has no centroids"))?
         .clone();
-    let residual_for_partition = |part_id: u32| -> Vec<f32> {
-        let centroid_values = centroids
-            .values()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("centroids must be Float32");
-        let start = (part_id as usize) * dim;
-        if matches!(mt, MetricType::L2 | MetricType::Cosine) {
-            (0..dim)
-                .map(|d| query[d] - centroid_values.value(start + d))
-                .collect()
-        } else {
-            query.to_vec()
-        }
-    };
-
-    // 2. Score PQ codes across probed partitions, build top (k*refine_factor)
-    //    candidate min-heap by PQ-approx distance.
+    let centroid_values = centroids
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("centroids must be Float32")
+        .clone();
     let candidate_count = (k * refine_factor.max(1)).max(k);
-    let mut top_heap: BinaryHeap<(OrderedF32, u64)> = BinaryHeap::with_capacity(candidate_count);
+    let num_queries = queries.len();
 
-    for &part_id in part_ids.values().iter() {
-        let residual = residual_for_partition(part_id);
-        let part_idx = part_id as usize;
-        let part_range = opened.ivf.row_range(part_idx);
-        if part_range.is_empty() {
-            continue;
-        }
-        let (pq_codes, row_ids) =
-            read_partition(&opened.index_file_reader, &opened.pq, part_range).await?;
+    // 1. Probe + PQ score every query. Each query owns its own top
+    //    `candidate_count` heap by approximate distance.
+    let t_probe_pq = Instant::now();
+    // (file_id, row_in_file, file_path) per refine candidate, per query.
+    let mut to_refine_by_query: Vec<Vec<(u32, u64, String)>> = vec![Vec::new(); num_queries];
+    for (qi, &query) in queries.iter().enumerate() {
+        let query_array = Float32Array::from(query.to_vec());
+        let (part_ids, _) =
+            opened
+                .ivf
+                .find_partitions(&query_array, nprobes.max(1), opened.metric)?;
 
-        for i in 0..row_ids.len() {
-            let code_offset = i * opened.pq.num_sub_vectors;
-            let dist = score_pq_code(&residual, &opened.pq, &pq_codes, code_offset, mt);
-            let rid = row_ids[i];
+        // Residuals: for L2/Cosine the index stores residual-encoded PQ codes
+        // (subtract centroid before scoring); Dot uses the raw query.
+        let residual_for_partition = |part_id: u32| -> Vec<f32> {
+            let start = (part_id as usize) * dim;
+            if matches!(mt, MetricType::L2 | MetricType::Cosine) {
+                (0..dim)
+                    .map(|d| query[d] - centroid_values.value(start + d))
+                    .collect()
+            } else {
+                query.to_vec()
+            }
+        };
 
-            if top_heap.len() < candidate_count {
-                top_heap.push((OrderedF32(dist), rid));
-            } else if let Some(top) = top_heap.peek() {
-                if dist < top.0.0 {
-                    top_heap.pop();
+        let mut top_heap: BinaryHeap<(OrderedF32, u64)> =
+            BinaryHeap::with_capacity(candidate_count);
+        for &part_id in part_ids.values().iter() {
+            let part_idx = part_id as usize;
+            let part_range = opened.ivf.row_range(part_idx);
+            if part_range.is_empty() {
+                continue;
+            }
+            let (pq_codes, row_ids) =
+                read_partition(&opened.index_file_reader, &opened.pq, part_range).await?;
+            if row_ids.is_empty() {
+                continue;
+            }
+
+            let num_sub_vectors = opened.pq.num_sub_vectors;
+            let pq_array = UInt8Array::from(pq_codes);
+            let transposed = transpose(&pq_array, row_ids.len(), num_sub_vectors);
+            let residual_arr = Float32Array::from(residual_for_partition(part_id));
+            let dists = opened.pq.compute_distances(&residual_arr, &transposed)?;
+            let dist_values = dists.values();
+
+            for (i, &rid) in row_ids.iter().enumerate() {
+                let dist = dist_values[i];
+                if top_heap.len() < candidate_count {
                     top_heap.push((OrderedF32(dist), rid));
+                } else if let Some(top) = top_heap.peek() {
+                    if dist < top.0.0 {
+                        top_heap.pop();
+                        top_heap.push((OrderedF32(dist), rid));
+                    }
                 }
             }
         }
-    }
 
-    // 3. Decode rids and apply RowFilter pre-refinement (so we skip parquet I/O
-    //    on dropped rows).
-    let candidates: Vec<u64> = top_heap.into_iter().map(|(_, rid)| rid).collect();
-    let mut to_refine: Vec<(u64, u32, u64, String)> = Vec::with_capacity(candidates.len());
-    for rid in candidates {
-        let file_id = (rid >> 32) as u32;
-        let row_in_file = rid & 0xFFFF_FFFF;
-        let file_path = opened
+        // Decode rids → (file_id, row_in_file, file_path) and apply the
+        // pre-refinement RowFilter so we don't pay parquet I/O on dropped rows.
+        let mut to_refine: Vec<(u32, u64, String)> = Vec::with_capacity(top_heap.len());
+        for (_, rid) in top_heap {
+            let file_id = (rid >> 32) as u32;
+            let row_in_file = rid & 0xFFFF_FFFF;
+            let file_path = opened
+                .manifest
+                .file_path(file_id)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "candidate rid {rid:#x} encodes file_id={file_id} but manifest has only {} files",
+                        opened.manifest.files.len()
+                    ))
+                })?
+                .to_string();
+            if let Some(f) = filter {
+                if !f.keep(&file_path, row_in_file) {
+                    continue;
+                }
+            }
+            to_refine.push((file_id, row_in_file, file_path));
+        }
+        to_refine_by_query[qi] = to_refine;
+    }
+    let probe_pq_ms = t_probe_pq.elapsed().as_millis();
+
+    // 2. Union candidate (file_path, row_in_file) pairs across all queries
+    //    so we issue ONE refinement read per file regardless of how much
+    //    overlap there is. Rows fetched per file are deduped; the per-query
+    //    re-rank below looks up each query's candidates by row_in_file.
+    let t_union = Instant::now();
+    let mut union_by_file: HashMap<String, std::collections::HashSet<u64>> = HashMap::new();
+    let mut total_candidate_pairs = 0usize;
+    for refs in &to_refine_by_query {
+        for (_, row, path) in refs {
+            union_by_file.entry(path.clone()).or_default().insert(*row);
+            total_candidate_pairs += 1;
+        }
+    }
+    let union_ms = t_union.elapsed().as_millis();
+
+    // 3+4. Refine candidates → per-query top-K. Two paths:
+    //   - SQ8 rerank store present: read co-located int8 codes by contiguous
+    //     byte-range and rerank with integer `l2_u8` — no source-parquet read.
+    //   - otherwise: the parquet refinement path (read originals from the source
+    //     vector column via the page-index-aware reader).
+    let t_refine = Instant::now();
+    let mut total_refine_open_ms: u128 = 0;
+    let mut total_refine_io_ms: u128 = 0;
+    let mut total_refine_rows: usize = 0;
+
+    let out: Vec<Vec<SearchResult>> = if let Some(rerank) = opened.rerank.as_ref() {
+        // Map every candidate (file_id, row_in_file) → global ordinal and fetch
+        // its SQ8 code once. `union_by_file` already deduped per file; flatten to
+        // ordinals across all files.
+        let mut ordinals: Vec<u64> = Vec::new();
+        for (file_path, row_set) in &union_by_file {
+            let file_id = opened.manifest.file_id(file_path).ok_or_else(|| {
+                Error::index(format!("refine: file '{file_path}' not in manifest"))
+            })?;
+            let base = opened.manifest.global_base(file_id).ok_or_else(|| {
+                Error::index(format!("refine: no global_base for file_id {file_id}"))
+            })?;
+            for &row in row_set {
+                ordinals.push(base + row);
+            }
+        }
+        total_refine_rows = ordinals.len();
+        let t_io = Instant::now();
+        let codes = rerank.fetch_codes(&ordinals).await?;
+        total_refine_io_ms = t_io.elapsed().as_millis();
+
+        let t_topk = Instant::now();
+        let mut out = Vec::with_capacity(num_queries);
+        for (qi, refs) in to_refine_by_query.iter().enumerate() {
+            let query_repr = rerank.encode_query(queries[qi])?;
+            let mut scored: Vec<(f32, &str, u64)> = Vec::with_capacity(refs.len());
+            for (file_id, row_in_file, file_path) in refs {
+                let base = opened.manifest.global_base(*file_id).expect("global_base");
+                let ord = base + *row_in_file;
+                let row_code = codes
+                    .get(&ord)
+                    .ok_or_else(|| Error::index(format!("refine: ordinal {ord} not fetched")))?;
+                let dist = rerank.distance(&query_repr, row_code);
+                scored.push((dist, file_path.as_str(), *row_in_file));
+            }
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            out.push(
+                scored
+                    .into_iter()
+                    .take(k)
+                    .map(|(dist, path, row_in_file)| SearchResult {
+                        file_path: path.to_string(),
+                        row_index: row_in_file,
+                        distance: dist,
+                    })
+                    .collect(),
+            );
+        }
+        let topk_ms = t_topk.elapsed().as_millis();
+        let refine_ms = t_refine.elapsed().as_millis();
+        let total_ms = t_start.elapsed().as_millis();
+        let store_kind = opened
             .manifest
-            .file_path(file_id)
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "candidate rid {rid:#x} encodes file_id={file_id} but manifest has only {} files",
-                    opened.manifest.files.len()
-                ))
-            })?
-            .to_string();
-        if let Some(f) = filter {
-            if !f.keep(&file_path, row_in_file) {
-                continue;
-            }
+            .rerank
+            .as_ref()
+            .map(|m| m.kind.as_str())
+            .unwrap_or("rerank");
+        log::info!(
+            "extidx_search_batch seq={batch_seq} store={store_kind} n_queries={num_queries} \
+             total={total_ms}ms probe_pq={probe_pq_ms}ms union={union_ms}ms refine={refine_ms}ms \
+             topk={topk_ms}ms refine_io={total_refine_io_ms}ms refine_rows={total_refine_rows} \
+             candidate_pairs={total_candidate_pairs}",
+        );
+        out
+    } else {
+        // file_path → (sorted_unique_row_indices, fetched FixedSizeListArray).
+        // The array's row order matches the sorted_unique_row_indices vector.
+        let mut fetched_by_file: HashMap<String, (Vec<u64>, FixedSizeListArray)> =
+            HashMap::with_capacity(union_by_file.len());
+        for (file_path, row_set) in union_by_file {
+            let mut sorted: Vec<u64> = row_set.into_iter().collect();
+            sorted.sort_unstable();
+            total_refine_rows += sorted.len();
+            let (fetched, open_ms, io_ms) = read_vectors_by_row_index(
+                &opened.parquet_meta_cache,
+                &file_path,
+                &opened.manifest.vector_column,
+                &sorted,
+            )
+            .await?;
+            total_refine_open_ms += open_ms;
+            total_refine_io_ms += io_ms;
+            fetched_by_file.insert(file_path, (sorted, fetched));
         }
-        to_refine.push((rid, file_id, row_in_file, file_path));
-    }
+        let refine_files = fetched_by_file.len();
+        let refine_ms = t_refine.elapsed().as_millis();
 
-    // 4. Per-file refinement reads.
-    let mut by_file: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
-    for (input_pos, &(_rid, _file_id, row_in_file, ref file_path)) in to_refine.iter().enumerate() {
-        by_file
-            .entry(file_path.clone())
-            .or_default()
-            .push((input_pos, row_in_file));
-    }
-
-    let mut exact_dists: Vec<(usize, f32)> = Vec::with_capacity(to_refine.len());
-    for (file_path, hits) in by_file {
-        let row_indices: Vec<u64> = hits.iter().map(|(_, r)| *r).collect();
-        let fetched =
-            read_vectors_by_row_index(&file_path, &opened.manifest.vector_column, &row_indices)?;
-        let dim = fetched.value_length() as usize;
-        let values = fetched
-            .values()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("Float32Array vectors");
-        for (out_idx, &(input_pos, _row)) in hits.iter().enumerate() {
-            let mut dist = 0.0f32;
-            for d in 0..dim {
-                let v = values.value(out_idx * dim + d);
-                let q = query[d];
-                let diff = v - q;
-                dist += diff * diff;
+        let t_topk = Instant::now();
+        let mut out: Vec<Vec<SearchResult>> = Vec::with_capacity(num_queries);
+        for (qi, refs) in to_refine_by_query.iter().enumerate() {
+            let query = queries[qi];
+            let mut scored: Vec<(f32, &str, u64)> = Vec::with_capacity(refs.len());
+            for (_, row_in_file, file_path) in refs {
+                let (sorted, fetched) = fetched_by_file
+                    .get(file_path)
+                    .expect("file_path missing from fetched union");
+                let pos = sorted.binary_search(row_in_file).map_err(|_| {
+                    Error::index(format!(
+                        "row_in_file {row_in_file} missing from refined union for {file_path}"
+                    ))
+                })?;
+                let dim = fetched.value_length() as usize;
+                let values = fetched
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("Float32Array vectors");
+                let mut dist = 0.0f32;
+                for d in 0..dim {
+                    let v = values.value(pos * dim + d);
+                    let q = query[d];
+                    let diff = v - q;
+                    dist += diff * diff;
+                }
+                let _ = mt; // L2 / Cosine approximation — see search() docs.
+                scored.push((dist, file_path.as_str(), *row_in_file));
             }
-            // For Cosine: distance is 1 - cosine similarity = 1 - (a·b/(|a||b|)).
-            // For L2: dist is the squared L2 above.
-            // For Dot: -dot.
-            // We approximate with squared L2 here for L2 and Cosine; full
-            // Cosine support lands in a follow-up after we plumb normalization
-            // through this path.
-            let _ = mt;
-            exact_dists.push((input_pos, dist));
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            out.push(
+                scored
+                    .into_iter()
+                    .take(k)
+                    .map(|(dist, path, row_in_file)| SearchResult {
+                        file_path: path.to_string(),
+                        row_index: row_in_file,
+                        distance: dist,
+                    })
+                    .collect(),
+            );
         }
-    }
+        let topk_ms = t_topk.elapsed().as_millis();
+        let total_ms = t_start.elapsed().as_millis();
+        log::info!(
+            "extidx_search_batch seq={batch_seq} store=parquet n_queries={num_queries} \
+             total={total_ms}ms probe_pq={probe_pq_ms}ms union={union_ms}ms refine={refine_ms}ms \
+             topk={topk_ms}ms refine_open={total_refine_open_ms}ms refine_io={total_refine_io_ms}ms \
+             refine_files={refine_files} refine_rows={total_refine_rows} \
+             candidate_pairs={total_candidate_pairs}",
+        );
+        out
+    };
 
-    // 5. Sort + top-K
-    exact_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    let mut out: Vec<SearchResult> = Vec::with_capacity(k);
-    for (input_pos, dist) in exact_dists.into_iter().take(k) {
-        let (_, _, row_in_file, file_path) = &to_refine[input_pos];
-        out.push(SearchResult {
-            file_path: file_path.clone(),
-            row_index: *row_in_file,
-            distance: dist,
-        });
-    }
     Ok(out)
 }
+
+/// Per-task monotonic counter assigning a sequence number to each `search()`
+/// call so log lines are ordered and joinable.
+static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Read one partition's PQ codes + row IDs from the index file.
 ///
@@ -231,61 +400,19 @@ async fn read_partition(
     Ok((pq_codes, row_ids))
 }
 
-/// Score one PQ code against the (residual or raw) query using the PQ codebook's
-/// distance tables. This is a slow, straightforward implementation — the SIMD
-/// fast path lives in `lance_index::vector::pq` and lands as a follow-up. For
-/// Phase 1 the goal is correctness; Phase 1.5 perf is acceptable as long as it
-/// matches the IVF probe's output.
-fn score_pq_code(
-    query_or_residual: &[f32],
-    pq: &ProductQuantizer,
-    pq_codes: &[u8],
-    code_offset: usize,
-    _mt: MetricType,
-) -> f32 {
-    let m = pq.num_sub_vectors;
-    let dim = pq.dimension;
-    let sub_dim = dim / m;
-
-    let codebook_values = pq
-        .codebook
-        .values()
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .expect("codebook is Float32");
-
-    let mut total = 0.0f32;
-    for s in 0..m {
-        let code = pq_codes[code_offset + s] as usize;
-        // codebook layout: [num_subvectors][num_codes][sub_dim]
-        let cb_offset = (s * (1usize << pq.num_bits) + code) * sub_dim;
-        let q_offset = s * sub_dim;
-        for d in 0..sub_dim {
-            let cb_val = codebook_values.value(cb_offset + d);
-            let q_val = query_or_residual[q_offset + d];
-            let diff = q_val - cb_val;
-            total += diff * diff;
-        }
-    }
-    total
-}
-
 /// Page-index-aware random fetch from one parquet file. Returns rows in
 /// caller-input order. The same primitive [`super::fetch_rows`] uses for
 /// post-topK materialization, but specialized to a single file (since
 /// refinement is already grouped by file at the call site).
-fn read_vectors_by_row_index(
+async fn read_vectors_by_row_index(
+    cache: &ParquetMetaCache,
     path: &str,
     column: &str,
     row_indices: &[u64],
-) -> Result<FixedSizeListArray> {
-    let file = File::open(path)
-        .map_err(|e| Error::invalid_input(format!("failed to open parquet {path}: {e}")))?;
-    let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new_with_options(file, opts).map_err(|e| {
-            Error::invalid_input(format!("failed to read parquet metadata for {path}: {e}"))
-        })?;
+) -> Result<(FixedSizeListArray, u128, u128)> {
+    let t_open = Instant::now();
+    let builder = super::parquet_source::open_parquet_cached(cache, path).await?;
+    let open_ms = t_open.elapsed().as_millis();
     let total_rows: u64 = builder.metadata().file_metadata().num_rows() as u64;
     let mask = ProjectionMask::columns(builder.parquet_schema(), [column]);
 
@@ -299,7 +426,7 @@ fn read_vectors_by_row_index(
         .collect();
     let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows as usize);
 
-    let reader = builder
+    let stream = builder
         .with_projection(mask)
         .with_row_selection(selection)
         .build()
@@ -307,11 +434,11 @@ fn read_vectors_by_row_index(
             Error::invalid_input(format!("failed to build parquet reader for {path}: {e}"))
         })?;
 
-    let batches: Vec<arrow_array::RecordBatch> = reader
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            Error::invalid_input(format!("error reading parquet batches from {path}: {e}"))
-        })?;
+    let t_io = Instant::now();
+    let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await.map_err(|e| {
+        Error::invalid_input(format!("error reading parquet batches from {path}: {e}"))
+    })?;
+    let io_ms = t_io.elapsed().as_millis();
 
     // Detect dim from the first non-empty batch's column. coerce_to_fsl handles both
     // FixedSizeList and List<Float32>.
@@ -373,8 +500,9 @@ fn read_vectors_by_row_index(
     let flat = Float32Array::from(reordered);
     let _ = ArrayRef::from(Arc::new(flat.clone()) as ArrayRef);
     use lance_arrow::FixedSizeListArrayExt;
-    Ok(FixedSizeListArray::try_new_from_values(flat, dim as i32)
-        .map_err(|e| Error::index(format!("failed to rebuild FSL: {e}")))?)
+    let fsl = FixedSizeListArray::try_new_from_values(flat, dim as i32)
+        .map_err(|e| Error::index(format!("failed to rebuild FSL: {e}")))?;
+    Ok((fsl, open_ms, io_ms))
 }
 
 // Wrap f32 to make it Ord-eligible for the BinaryHeap. Heap is a max-heap so we

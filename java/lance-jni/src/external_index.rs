@@ -28,8 +28,8 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jbyteArray, jfloat, jint, jlong, jlongArray};
 use lance::index::vector::external::{
-    ExternalIvfPqIndex, ExternalIvfPqIndexParams, ParquetFileSpec, ParquetRowKey, RowFilter,
-    SearchResult,
+    ExternalIvfPqIndex, ExternalIvfPqIndexParams, ParquetFileSpec, ParquetRowKey, RerankStore,
+    RowFilter, SearchResult,
 };
 use lance_linalg::distance::MetricType;
 
@@ -92,6 +92,17 @@ fn build_filter_from_bytes(
     }))
 }
 
+fn parse_rerank_store(s: &str) -> Result<RerankStore> {
+    match s.to_ascii_lowercase().as_str() {
+        "none" | "" => Ok(RerankStore::None),
+        "sq8" => Ok(RerankStore::Sq8),
+        "flat" => Ok(RerankStore::Flat),
+        other => Err(Error::input_error(format!(
+            "unsupported rerank store '{other}'; expected one of None, Sq8, Flat"
+        ))),
+    }
+}
+
 fn parse_metric(s: &str) -> Result<MetricType> {
     match s.to_ascii_lowercase().as_str() {
         "l2" => Ok(MetricType::L2),
@@ -117,6 +128,7 @@ pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeBu
     max_iters: jint,
     sample_rate: jint,
     seed: jlong,
+    rerank_store: JString<'local>,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -132,6 +144,7 @@ pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeBu
             max_iters,
             sample_rate,
             seed,
+            rerank_store,
         )
     )
 }
@@ -149,6 +162,7 @@ fn inner_build<'local>(
     max_iters: jint,
     sample_rate: jint,
     seed: jlong,
+    rerank_store: JString<'local>,
 ) -> Result<JObject<'local>> {
     let n = env.get_array_length(&file_paths)?;
     let mut files: Vec<ParquetFileSpec> = Vec::with_capacity(n as usize);
@@ -161,6 +175,7 @@ fn inner_build<'local>(
     let vector_column_str: String = vector_column.extract(env)?;
     let output_uri_str: String = output_uri.extract(env)?;
     let metric_str: String = metric.extract(env)?;
+    let rerank_store_str: String = rerank_store.extract(env)?;
 
     let params = ExternalIvfPqIndexParams::builder()
         .num_partitions(num_partitions as usize)
@@ -170,6 +185,7 @@ fn inner_build<'local>(
         .max_iters(max_iters as usize)
         .sample_rate(sample_rate as usize)
         .seed(seed as u64)
+        .rerank_store(parse_rerank_store(&rerank_store_str)?)
         .build();
 
     let uuid = RT.block_on(async move {
@@ -302,6 +318,100 @@ fn inner_search<'local>(
         env.set_object_array_element(&array, i as i32, obj)?;
     }
     Ok(array.into())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeSearchBatch<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    queries: JObjectArray<'local>,
+    k: jint,
+    nprobes: jint,
+    refine_factor: jint,
+    deleted_bitmap: JByteArray<'local>,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_search_batch(
+            &mut env,
+            handle,
+            queries,
+            k,
+            nprobes,
+            refine_factor,
+            deleted_bitmap,
+        )
+    )
+}
+
+fn inner_search_batch<'local>(
+    env: &mut JNIEnv<'local>,
+    handle: jlong,
+    queries: JObjectArray<'local>,
+    k: jint,
+    nprobes: jint,
+    refine_factor: jint,
+    deleted_bitmap: JByteArray<'local>,
+) -> Result<JObject<'local>> {
+    let idx = handle_to_idx(handle)?;
+
+    // Decode float[][] queries → Vec<Vec<f32>> (owned).
+    let n_queries = env.get_array_length(&queries)?;
+    let mut owned: Vec<Vec<jfloat>> = Vec::with_capacity(n_queries as usize);
+    for i in 0..n_queries {
+        let row_obj = env.get_object_array_element(&queries, i)?;
+        let row: jni::objects::JFloatArray = row_obj.into();
+        let row_len = env.get_array_length(&row)?;
+        let mut buf: Vec<jfloat> = vec![0.0; row_len as usize];
+        env.get_float_array_region(&row, 0, &mut buf)?;
+        owned.push(buf);
+    }
+    let query_refs: Vec<&[f32]> = owned.iter().map(|v| v.as_slice()).collect();
+
+    let mut file_id_by_path: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::with_capacity(idx.num_files());
+    for fid in 0..idx.num_files() as u32 {
+        if let Some(p) = idx.file_path(fid) {
+            file_id_by_path.insert(p.to_string(), fid);
+        }
+    }
+    let filter = build_filter_from_bytes(env, &deleted_bitmap, file_id_by_path)?;
+
+    let batched: Vec<Vec<SearchResult>> = RT.block_on(async {
+        idx.search_batch(
+            &query_refs,
+            k as usize,
+            nprobes as usize,
+            refine_factor as usize,
+            filter.as_ref().map(|f| f as &dyn RowFilter),
+        )
+        .await
+    })?;
+
+    // Build SearchResult[][] in Java.
+    let result_class = env.find_class("org/lance/index/external/SearchResult")?;
+    let result_array_class = env.find_class("[Lorg/lance/index/external/SearchResult;")?;
+    let outer = env.new_object_array(batched.len() as i32, &result_array_class, JObject::null())?;
+    for (qi, results) in batched.iter().enumerate() {
+        let inner =
+            env.new_object_array(results.len() as i32, &result_class, JObject::null())?;
+        for (i, r) in results.iter().enumerate() {
+            let path = env.new_string(&r.file_path)?;
+            let obj = env.new_object(
+                &result_class,
+                "(Ljava/lang/String;JF)V",
+                &[
+                    JValue::Object(&path),
+                    JValue::Long(r.row_index as i64),
+                    JValue::Float(r.distance),
+                ],
+            )?;
+            env.set_object_array_element(&inner, i as i32, obj)?;
+        }
+        env.set_object_array_element(&outer, qi as i32, inner)?;
+    }
+    Ok(outer.into())
 }
 
 #[unsafe(no_mangle)]

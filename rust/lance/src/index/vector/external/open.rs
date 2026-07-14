@@ -26,6 +26,8 @@ use lance_linalg::distance::DistanceType;
 use object_store::path::Path;
 
 use super::manifest::{ExternalIndexManifest, read_manifest};
+use super::parquet_source::ParquetMetaCache;
+use super::rerank::{RerankReader, rerank_meta};
 
 /// Constants. `INDEX_FILE_NAME` mirrors what the build path writes.
 pub const INDEX_FILE_NAME: &str = "index.idx";
@@ -47,6 +49,16 @@ pub struct OpenedExternalIndex {
     pub object_store: Arc<ObjectStore>,
     pub index_dir: Path,
     pub index_file_reader: Arc<dyn Reader>,
+    /// Per-source-parquet metadata cache shared by the search refinement and
+    /// `fetch_rows` paths. Populated lazily on first read of each file; reused
+    /// across all subsequent queries on this handle. Skips URI resolution +
+    /// `head` + footer/page-index fetch on every cached read — the three
+    /// per-call abfss/S3 round trips that dominate per-query latency.
+    pub(super) parquet_meta_cache: Arc<ParquetMetaCache>,
+    /// Opened SQ8 rerank sidecar, when the index was built with one. Present →
+    /// refinement reranks against co-located int8 codes instead of re-reading
+    /// the source parquet vector column. `None` → the parquet refine path.
+    pub(super) rerank: Option<RerankReader>,
 }
 
 /// Resolve `uri` into `(ObjectStore, Path)`, then load both the manifest and the
@@ -74,6 +86,24 @@ pub async fn open_index(uri: &str) -> Result<OpenedExternalIndex> {
     let pb_index: pb::Index = read_message(reader.as_ref(), metadata_offset).await?;
     let (ivf, pq, metric) = decode_pb_index(&pb_index)?;
 
+    // Open the rerank sidecar (sq8 or flat) if the manifest records one. Guard that
+    // its stored dimension matches the index's — a mismatch means a corrupt or
+    // mis-paired sidecar and would silently mis-rank, so fail fast at open.
+    let rerank = match rerank_meta(&manifest) {
+        Some(meta) => {
+            let store = RerankReader::open(&object_store, &index_dir, meta.clone()).await?;
+            let index_dim = ivf.dimension();
+            if store.dim() != index_dim {
+                return Err(Error::index(format!(
+                    "rerank store dim {} != index dim {index_dim}",
+                    store.dim()
+                )));
+            }
+            Some(store)
+        }
+        None => None,
+    };
+
     Ok(OpenedExternalIndex {
         manifest,
         ivf,
@@ -82,6 +112,8 @@ pub async fn open_index(uri: &str) -> Result<OpenedExternalIndex> {
         object_store,
         index_dir,
         index_file_reader: reader,
+        parquet_meta_cache: Arc::new(ParquetMetaCache::new()),
+        rerank,
     })
 }
 

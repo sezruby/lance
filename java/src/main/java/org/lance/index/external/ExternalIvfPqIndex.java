@@ -89,7 +89,8 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
         params.getMetric().toRustString(),
         params.getMaxIters(),
         params.getSampleRate(),
-        params.getSeed());
+        params.getSeed(),
+        params.getRerankStore().toRustString());
   }
 
   /**
@@ -117,6 +118,26 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
       float[] query, int k, int nprobes, int refineFactor, byte[] deletedRids) {
     SearchResult[] arr = nativeSearch(handle, query, k, nprobes, refineFactor, deletedRids);
     return java.util.Arrays.asList(arr);
+  }
+
+  /**
+   * Batched variant of {@link #search}. Runs {@code queries.length} queries in one JNI call,
+   * sharing a single per-file refinement read across the whole batch. Designed for offline join
+   * workloads where many query vectors are available up-front and would otherwise repeat the same
+   * parquet fetches.
+   *
+   * <p>Returns a list with one entry per input query, in input order. Each entry is the same
+   * top-{@code k} list that {@link #search} would have returned for that query.
+   */
+  public List<List<SearchResult>> searchBatch(
+      float[][] queries, int k, int nprobes, int refineFactor, byte[] deletedRids) {
+    SearchResult[][] arr =
+        nativeSearchBatch(handle, queries, k, nprobes, refineFactor, deletedRids);
+    List<List<SearchResult>> out = new java.util.ArrayList<>(arr.length);
+    for (SearchResult[] row : arr) {
+      out.add(java.util.Arrays.asList(row));
+    }
+    return out;
   }
 
   /**
@@ -189,7 +210,8 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
       String metric,
       int maxIters,
       int sampleRate,
-      long seed);
+      long seed,
+      String rerankStore);
 
   private static native long nativeOpen(String uri);
 
@@ -197,6 +219,9 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
 
   private static native SearchResult[] nativeSearch(
       long handle, float[] query, int k, int nprobes, int refineFactor, byte[] deletedRids);
+
+  private static native SearchResult[][] nativeSearchBatch(
+      long handle, float[][] queries, int k, int nprobes, int refineFactor, byte[] deletedRids);
 
   private static native byte[] nativeFetchRows(
       long handle, String[] filePaths, long[] rowIndices, String[] projection);

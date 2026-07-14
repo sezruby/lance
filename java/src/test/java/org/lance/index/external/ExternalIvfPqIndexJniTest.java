@@ -13,8 +13,9 @@
  */
 package org.lance.index.external;
 
-import org.junit.jupiter.api.Test;
 import org.lance.JniLoader;
+
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -24,10 +25,10 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * Smoke tests for the JNI surface. Full end-to-end coverage (build + open + search +
- * fetchRows) lives in {@code rust/lance/tests/external_index_phase1.rs}, which exercises
- * the same code path the JNI calls into. Java-side seeding of parquet test data
- * requires a parquet writer dependency and is deferred to phase 1.7-followup.
+ * Smoke tests for the JNI surface. Full end-to-end coverage (build + open + search + fetchRows)
+ * lives in {@code rust/lance/tests/external_index_phase1.rs}, which exercises the same code path
+ * the JNI calls into. Java-side seeding of parquet test data requires a parquet writer dependency
+ * and is deferred to phase 1.7-followup.
  */
 public class ExternalIvfPqIndexJniTest {
   static {
@@ -43,15 +44,13 @@ public class ExternalIvfPqIndexJniTest {
     assertEquals(16, packed.length, "two u64s = 16 bytes");
 
     // First rid: (0 << 32) | 0 = 0
-    long first = java.nio.ByteBuffer.wrap(packed, 0, 8)
-        .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        .getLong();
+    long first =
+        java.nio.ByteBuffer.wrap(packed, 0, 8).order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong();
     assertEquals(0L, first);
 
     // Second rid: (1 << 32) | 42 = 4294967338
-    long second = java.nio.ByteBuffer.wrap(packed, 8, 8)
-        .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        .getLong();
+    long second =
+        java.nio.ByteBuffer.wrap(packed, 8, 8).order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong();
     assertEquals((1L << 32) | 42L, second);
   }
 
@@ -77,6 +76,11 @@ public class ExternalIvfPqIndexJniTest {
     assertEquals(8, p.getNumBitsPerSubVector());
     assertEquals(ExternalIvfPqIndexParams.Metric.L2, p.getMetric());
     assertNotNull(p.getMetric().toRustString());
+    // Rerank store defaults off and maps to the Rust variant name the JNI parses.
+    assertEquals(ExternalIvfPqIndexParams.RerankStore.NONE, p.getRerankStore());
+    assertEquals("None", p.getRerankStore().toRustString());
+    assertEquals("Sq8", ExternalIvfPqIndexParams.RerankStore.SQ8.toRustString());
+    assertEquals("Flat", ExternalIvfPqIndexParams.RerankStore.FLAT.toRustString());
   }
 
   @Test

@@ -15,21 +15,19 @@
 //! for surviving top-K rows — a hard win on materialize I/O for large R.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{Field, Schema, SchemaRef};
+use futures::TryStreamExt;
 use lance_core::{Error, Result};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-};
-use parquet::file::metadata::PageIndexPolicy;
+use parquet::arrow::arrow_reader::RowSelection;
 
 use super::open::OpenedExternalIndex;
+use super::parquet_source::{ParquetMetaCache, open_parquet_async, open_parquet_cached};
 use super::types::ParquetRowKey;
 
 /// Fetch rows by `(file_path, row_index)` from the registered parquet files.
@@ -77,7 +75,7 @@ pub async fn fetch_rows(
     // of the projected schema if the input is empty.
     if row_keys.is_empty() {
         let any_path = &opened.manifest.files[0].file_path;
-        let schema = projected_schema_from_file(any_path, projection)?;
+        let schema = projected_schema_from_file(any_path, projection).await?;
         return Ok(RecordBatch::new_empty(schema));
     }
 
@@ -87,7 +85,13 @@ pub async fn fetch_rows(
     let mut shared_schema: Option<SchemaRef> = None;
     for (file_path, hits) in by_file {
         let row_indices: Vec<u64> = hits.iter().map(|(_, r)| *r).collect();
-        let batch = read_rows_from_file(&file_path, projection, &row_indices)?;
+        let batch = read_rows_from_file(
+            &opened.parquet_meta_cache,
+            &file_path,
+            projection,
+            &row_indices,
+        )
+        .await?;
         if shared_schema.is_none() {
             shared_schema = Some(batch.schema());
         }
@@ -155,18 +159,13 @@ pub async fn fetch_rows(
 /// Read the requested `row_indices` of `projection` columns from one parquet
 /// file. Returns a single `RecordBatch` with rows in **deduped sorted order**.
 /// Caller is responsible for reordering to its input order.
-fn read_rows_from_file(
+async fn read_rows_from_file(
+    cache: &ParquetMetaCache,
     path: &str,
     projection: &[&str],
     row_indices: &[u64],
 ) -> Result<RecordBatch> {
-    let file = File::open(path)
-        .map_err(|e| Error::invalid_input(format!("fetch_rows: failed to open {path}: {e}")))?;
-    let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new_with_options(file, opts).map_err(|e| {
-            Error::invalid_input(format!("fetch_rows: failed parquet meta {path}: {e}"))
-        })?;
+    let builder = open_parquet_cached(cache, path).await?;
     let total_rows: u64 = builder.metadata().file_metadata().num_rows() as u64;
 
     let mask = ProjectionMask::columns(builder.parquet_schema(), projection.iter().copied());
@@ -187,18 +186,19 @@ fn read_rows_from_file(
         .collect();
     let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows as usize);
 
-    let reader = builder
+    let stream = builder
         .with_projection(mask)
         .with_row_selection(selection)
         .build()
         .map_err(|e| Error::invalid_input(format!("fetch_rows: build reader {path}: {e}")))?;
 
-    let batches: Vec<RecordBatch> = reader
-        .collect::<std::result::Result<Vec<_>, _>>()
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
         .map_err(|e| Error::invalid_input(format!("fetch_rows: read {path}: {e}")))?;
     if batches.is_empty() {
         // Build an empty batch with the projected schema.
-        let schema = projected_schema_from_file(path, projection)?;
+        let schema = projected_schema_from_file(path, projection).await?;
         return Ok(RecordBatch::new_empty(schema));
     }
     let schema = batches[0].schema();
@@ -206,12 +206,8 @@ fn read_rows_from_file(
         .map_err(|e| Error::index(format!("fetch_rows: concat batches from {path}: {e}")))
 }
 
-fn projected_schema_from_file(path: &str, projection: &[&str]) -> Result<SchemaRef> {
-    let file = File::open(path)
-        .map_err(|e| Error::invalid_input(format!("fetch_rows: failed to open {path}: {e}")))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-        Error::invalid_input(format!("fetch_rows: failed parquet meta {path}: {e}"))
-    })?;
+async fn projected_schema_from_file(path: &str, projection: &[&str]) -> Result<SchemaRef> {
+    let builder = open_parquet_async(path).await?;
     let arrow_schema = builder.schema();
     let fields: Vec<Field> = projection
         .iter()

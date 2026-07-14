@@ -37,10 +37,11 @@ pub(crate) mod manifest;
 pub(crate) mod open;
 pub mod params;
 pub(crate) mod parquet_source;
+mod rerank;
 mod search;
 pub mod types;
 
-pub use params::ExternalIvfPqIndexParams;
+pub use params::{ExternalIvfPqIndexParams, RerankStore};
 pub use types::{ParquetFileSpec, ParquetRowKey, RowFilter, SearchResult};
 
 use arrow_array::RecordBatch;
@@ -148,6 +149,23 @@ impl ExternalIvfPqIndex {
         filter: Option<&dyn RowFilter>,
     ) -> Result<Vec<SearchResult>> {
         search::search(&self.inner, query, k, nprobes, refine_factor, filter).await
+    }
+
+    /// Batched variant of [`search`](Self::search). Runs `queries.len()` queries
+    /// in one call, sharing a single per-file refinement read across the whole
+    /// batch. Designed for offline join workloads where many query vectors are
+    /// available up-front and would otherwise repeat the same parquet fetches.
+    ///
+    /// Returns `Vec<Vec<SearchResult>>` in 1:1 correspondence with `queries`.
+    pub async fn search_batch(
+        &self,
+        queries: &[&[f32]],
+        k: usize,
+        nprobes: usize,
+        refine_factor: usize,
+        filter: Option<&dyn RowFilter>,
+    ) -> Result<Vec<Vec<SearchResult>>> {
+        search::search_batch(&self.inner, queries, k, nprobes, refine_factor, filter).await
     }
 
     /// Random-access fetch by `(file_path, row_index)` keys.
@@ -325,6 +343,72 @@ mod tests {
         );
     }
 
+    /// search_batch must produce identical (file_path, row_index, distance)
+    /// triples to running `search()` per query — this is the correctness
+    /// invariant that lets us collapse N per-query refinement reads into one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_batch_matches_per_query_search() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        const NUM_VECTORS: usize = 1024;
+        const DIM: usize = 8;
+        const K: usize = 10;
+        const NUM_PARTITIONS: usize = 4;
+        const NUM_SUB_VECTORS: usize = 2;
+
+        let tmp_data = TempDir::new().unwrap();
+        let p = tmp_data.path().join("vec.parquet");
+        write_random_parquet(&p, NUM_VECTORS, DIM, 7);
+
+        let tmp_out = TempDir::new().unwrap();
+        let params = ExternalIvfPqIndexParams::builder()
+            .num_partitions(NUM_PARTITIONS)
+            .num_sub_vectors(NUM_SUB_VECTORS)
+            .num_bits_per_sub_vector(8)
+            .metric(MetricType::L2)
+            .max_iters(10)
+            .sample_rate(64)
+            .build();
+        let files = vec![ParquetFileSpec::of(p.to_str().unwrap())];
+        let uuid =
+            ExternalIvfPqIndex::build(files, "vec", tmp_out.path().to_str().unwrap(), params)
+                .await
+                .expect("build_index");
+        let idx = ExternalIvfPqIndex::open(tmp_out.path().join(uuid.to_string()).to_str().unwrap())
+            .await
+            .expect("open");
+
+        let mut rng = StdRng::seed_from_u64(123);
+        let queries: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+            .collect();
+
+        // Per-query reference.
+        let mut per_query_results: Vec<Vec<SearchResult>> = Vec::with_capacity(queries.len());
+        for q in &queries {
+            let r = idx
+                .search(q, K, /* nprobes */ 4, /* refine_factor */ 4, None)
+                .await
+                .unwrap();
+            per_query_results.push(r);
+        }
+
+        // Batched.
+        let q_refs: Vec<&[f32]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batched = idx.search_batch(&q_refs, K, 4, 4, None).await.unwrap();
+
+        assert_eq!(batched.len(), per_query_results.len());
+        for (i, (a, b)) in batched.iter().zip(per_query_results.iter()).enumerate() {
+            assert_eq!(a.len(), b.len(), "result count differs at query {i}");
+            for (j, (ar, br)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(ar.file_path, br.file_path, "file_path differs at q{i}/{j}");
+                assert_eq!(ar.row_index, br.row_index, "row_index differs at q{i}/{j}");
+                let diff = (ar.distance - br.distance).abs();
+                assert!(diff < 1e-4, "distance differs at q{i}/{j}: {diff}");
+            }
+        }
+    }
+
     /// fetch_rows() returns parquet projection cols for arbitrary (file_path,
     /// row_index) keys, in caller-input order, including duplicates and
     /// non-vector columns.
@@ -493,5 +577,317 @@ mod tests {
         assert_eq!(idx.vector_column(), "vec");
         assert_eq!(idx.file_path(0), Some(p.to_str().unwrap()));
         assert_eq!(idx.file_path(1), None);
+    }
+
+    /// With an SQ8 rerank store, build() writes the `rerank.sq8` sidecar, records
+    /// its meta in the manifest, and search() reranks against the int8 codes
+    /// (no source-parquet refine read) — recall should stay at least as good as
+    /// the parquet-refine path, since SQ8 is a near-exact stand-in for the f32
+    /// originals that path re-reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sq8_store_builds_and_reranks_with_recall() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        const NUM_VECTORS: usize = 1024;
+        const DIM: usize = 16;
+        const K: usize = 10;
+        const NUM_PARTITIONS: usize = 4;
+        const NUM_SUB_VECTORS: usize = 4;
+
+        let tmp_data = TempDir::new().unwrap();
+        let p = tmp_data.path().join("vec.parquet");
+        write_random_parquet(&p, NUM_VECTORS, DIM, 2024);
+
+        let all_vectors = {
+            let file = std::fs::File::open(&p).unwrap();
+            let builder =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .unwrap();
+            let reader = builder.build().unwrap();
+            let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
+            let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
+            arrow::compute::concat(&arrays)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap()
+                .clone()
+        };
+
+        let make_params = |store: params::RerankStore| {
+            ExternalIvfPqIndexParams::builder()
+                .num_partitions(NUM_PARTITIONS)
+                .num_sub_vectors(NUM_SUB_VECTORS)
+                .num_bits_per_sub_vector(8)
+                .metric(MetricType::L2)
+                .max_iters(10)
+                .sample_rate(64)
+                .rerank_store(store)
+                .build()
+        };
+        let spec = || vec![ParquetFileSpec::of(p.to_str().unwrap())];
+
+        // SQ8 index.
+        let tmp_sq8 = TempDir::new().unwrap();
+        let uuid_sq8 = ExternalIvfPqIndex::build(
+            spec(),
+            "vec",
+            tmp_sq8.path().to_str().unwrap(),
+            make_params(params::RerankStore::Sq8),
+        )
+        .await
+        .expect("build sq8");
+
+        // The sidecar exists and is the right size: total_rows * dim bytes.
+        let sq8_dir = tmp_sq8.path().join(uuid_sq8.to_string());
+        let sidecar = sq8_dir.join("rerank.sq8");
+        let meta = std::fs::metadata(&sidecar).expect("rerank.sq8 must exist");
+        assert_eq!(meta.len(), (NUM_VECTORS * DIM) as u64);
+
+        let idx_sq8 = ExternalIvfPqIndex::open(sq8_dir.to_str().unwrap())
+            .await
+            .expect("open sq8");
+
+        // Parquet-refine index over the same data, as a recall reference.
+        let tmp_pq = TempDir::new().unwrap();
+        let uuid_pq = ExternalIvfPqIndex::build(
+            spec(),
+            "vec",
+            tmp_pq.path().to_str().unwrap(),
+            make_params(params::RerankStore::None),
+        )
+        .await
+        .expect("build none");
+        let idx_pq =
+            ExternalIvfPqIndex::open(tmp_pq.path().join(uuid_pq.to_string()).to_str().unwrap())
+                .await
+                .expect("open none");
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let total_queries = 24;
+        let mut sq8_hits = 0;
+        let mut pq_hits = 0;
+        for _ in 0..total_queries {
+            let query: Vec<f32> = (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let truth: std::collections::HashSet<u64> = brute_force_topk(&all_vectors, &query, K)
+                .iter()
+                .map(|(i, _)| *i as u64)
+                .collect();
+
+            let r_sq8 = idx_sq8
+                .search(&query, K, 4, 4, None)
+                .await
+                .expect("sq8 search");
+            let r_pq = idx_pq
+                .search(&query, K, 4, 4, None)
+                .await
+                .expect("pq search");
+            assert!(!r_sq8.is_empty());
+
+            let s_sq8: std::collections::HashSet<u64> = r_sq8.iter().map(|r| r.row_index).collect();
+            let s_pq: std::collections::HashSet<u64> = r_pq.iter().map(|r| r.row_index).collect();
+            if s_sq8.intersection(&truth).count() >= K / 2 {
+                sq8_hits += 1;
+            }
+            if s_pq.intersection(&truth).count() >= K / 2 {
+                pq_hits += 1;
+            }
+        }
+        // SQ8 recall must clear the bar and not trail the parquet-refine path by
+        // more than one query (SQ8 ≈ exact f32 rerank for ordering).
+        assert!(
+            sq8_hits >= total_queries / 2,
+            "sq8 recall too low: {sq8_hits}/{total_queries}"
+        );
+        assert!(
+            sq8_hits + 1 >= pq_hits,
+            "sq8 recall ({sq8_hits}) trails parquet refine ({pq_hits}) by >1"
+        );
+    }
+
+    /// The Flat (full-precision f32) rerank store: build writes a `rerank.flat`
+    /// sidecar of exactly `total_rows * dim * 4` bytes, and its exact-distance
+    /// refine gives recall at least as good as SQ8 over the same data (exact ≥
+    /// quantized). Same layout/plumbing as SQ8 — this guards the f32 branch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flat_store_builds_and_reranks_at_least_as_well_as_sq8() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        const NUM_VECTORS: usize = 1024;
+        const DIM: usize = 16;
+        const K: usize = 10;
+
+        let tmp_data = TempDir::new().unwrap();
+        let p = tmp_data.path().join("vec.parquet");
+        write_random_parquet(&p, NUM_VECTORS, DIM, 2024);
+
+        let all_vectors = {
+            let file = std::fs::File::open(&p).unwrap();
+            let builder =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .unwrap();
+            let batches: Vec<RecordBatch> = builder.build().unwrap().map(|r| r.unwrap()).collect();
+            let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
+            arrow::compute::concat(&arrays)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap()
+                .clone()
+        };
+
+        let make_params = |store: params::RerankStore| {
+            ExternalIvfPqIndexParams::builder()
+                .num_partitions(4)
+                .num_sub_vectors(4)
+                .num_bits_per_sub_vector(8)
+                .metric(MetricType::L2)
+                .max_iters(10)
+                .sample_rate(64)
+                .rerank_store(store)
+                .build()
+        };
+        let spec = || vec![ParquetFileSpec::of(p.to_str().unwrap())];
+
+        let tmp_flat = TempDir::new().unwrap();
+        let uuid_flat = ExternalIvfPqIndex::build(
+            spec(),
+            "vec",
+            tmp_flat.path().to_str().unwrap(),
+            make_params(params::RerankStore::Flat),
+        )
+        .await
+        .expect("build flat");
+
+        // Sidecar is full-precision: total_rows * dim * 4 bytes.
+        let flat_dir = tmp_flat.path().join(uuid_flat.to_string());
+        let meta = std::fs::metadata(flat_dir.join("rerank.flat")).expect("rerank.flat must exist");
+        assert_eq!(meta.len(), (NUM_VECTORS * DIM * 4) as u64);
+
+        let idx_flat = ExternalIvfPqIndex::open(flat_dir.to_str().unwrap())
+            .await
+            .expect("open flat");
+
+        let tmp_sq8 = TempDir::new().unwrap();
+        let uuid_sq8 = ExternalIvfPqIndex::build(
+            spec(),
+            "vec",
+            tmp_sq8.path().to_str().unwrap(),
+            make_params(params::RerankStore::Sq8),
+        )
+        .await
+        .expect("build sq8");
+        let idx_sq8 =
+            ExternalIvfPqIndex::open(tmp_sq8.path().join(uuid_sq8.to_string()).to_str().unwrap())
+                .await
+                .expect("open sq8");
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let total_queries = 24;
+        let mut flat_hits = 0;
+        let mut sq8_hits = 0;
+        for _ in 0..total_queries {
+            let query: Vec<f32> = (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let truth: std::collections::HashSet<u64> = brute_force_topk(&all_vectors, &query, K)
+                .iter()
+                .map(|(i, _)| *i as u64)
+                .collect();
+            let r_flat = idx_flat
+                .search(&query, K, 4, 4, None)
+                .await
+                .expect("flat search");
+            let r_sq8 = idx_sq8
+                .search(&query, K, 4, 4, None)
+                .await
+                .expect("sq8 search");
+            assert!(!r_flat.is_empty());
+            let s_flat: std::collections::HashSet<u64> =
+                r_flat.iter().map(|r| r.row_index).collect();
+            let s_sq8: std::collections::HashSet<u64> = r_sq8.iter().map(|r| r.row_index).collect();
+            if s_flat.intersection(&truth).count() >= K / 2 {
+                flat_hits += 1;
+            }
+            if s_sq8.intersection(&truth).count() >= K / 2 {
+                sq8_hits += 1;
+            }
+        }
+        assert!(
+            flat_hits >= total_queries / 2,
+            "flat recall too low: {flat_hits}/{total_queries}"
+        );
+        // Exact refine should not trail quantized refine (allow 1 query of slack for
+        // ties at this toy scale).
+        assert!(
+            flat_hits + 1 >= sq8_hits,
+            "flat recall ({flat_hits}) trails sq8 ({sq8_hits}) by >1 — exact should match or beat"
+        );
+    }
+
+    /// Multi-file SQ8: the sidecar is row-major by *global* ordinal
+    /// (`global_base(file_id) + row_in_file`), so rerank must map candidate rids
+    /// from different files to the right byte range. Two files force a non-zero
+    /// base on the second file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sq8_store_multi_file_global_ordinal() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        const N0: usize = 512;
+        const N1: usize = 640;
+        const DIM: usize = 16;
+        const K: usize = 10;
+
+        let tmp_data = TempDir::new().unwrap();
+        let p0 = tmp_data.path().join("a.parquet");
+        let p1 = tmp_data.path().join("b.parquet");
+        write_random_parquet(&p0, N0, DIM, 11);
+        write_random_parquet(&p1, N1, DIM, 22);
+
+        let tmp_out = TempDir::new().unwrap();
+        let params = ExternalIvfPqIndexParams::builder()
+            .num_partitions(4)
+            .num_sub_vectors(4)
+            .num_bits_per_sub_vector(8)
+            .metric(MetricType::L2)
+            .max_iters(10)
+            .sample_rate(64)
+            .rerank_store(params::RerankStore::Sq8)
+            .build();
+        let files = vec![
+            ParquetFileSpec::of(p0.to_str().unwrap()),
+            ParquetFileSpec::of(p1.to_str().unwrap()),
+        ];
+        let uuid =
+            ExternalIvfPqIndex::build(files, "vec", tmp_out.path().to_str().unwrap(), params)
+                .await
+                .expect("build");
+
+        // Sidecar size covers both files' rows.
+        let dir = tmp_out.path().join(uuid.to_string());
+        let sz = std::fs::metadata(dir.join("rerank.sq8")).unwrap().len();
+        assert_eq!(sz, ((N0 + N1) * DIM) as u64);
+
+        let idx = ExternalIvfPqIndex::open(dir.to_str().unwrap())
+            .await
+            .expect("open");
+
+        // Queries return valid hits keyed to the correct file; row_index must be
+        // in-range for whichever file it names (proves ordinal→(file,row) is
+        // consistent end to end).
+        let mut rng = StdRng::seed_from_u64(5);
+        for _ in 0..16 {
+            let query: Vec<f32> = (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let results = idx.search(&query, K, 4, 4, None).await.expect("search");
+            assert!(!results.is_empty());
+            for r in &results {
+                let limit = if r.file_path == p0.to_str().unwrap() {
+                    N0 as u64
+                } else if r.file_path == p1.to_str().unwrap() {
+                    N1 as u64
+                } else {
+                    panic!("unexpected file_path {}", r.file_path);
+                };
+                assert!(r.row_index < limit, "row_index {} >= {limit}", r.row_index);
+            }
+        }
     }
 }

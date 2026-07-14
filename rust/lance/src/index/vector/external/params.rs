@@ -5,6 +5,43 @@
 
 use lance_linalg::distance::MetricType;
 
+/// Co-located rerank store: an optional per-row vector representation written
+/// alongside the index so the refinement step can recompute exact-ish distances
+/// without re-reading the wide vector column from the source parquet.
+///
+/// The IVF-PQ index only persists PQ codes (≈16 B/row); refinement therefore has
+/// to fetch the original vectors to re-rank candidates. Reading those from the
+/// source parquet page-decodes a multi-MB data page per scattered candidate row
+/// — the dominant per-query cost on wide (e.g. dim=1024) embeddings. A rerank
+/// store trades build-time storage for a contiguous, page-decode-free refine read.
+///
+/// This is orthogonal to the coarse index type: it is "store the vector for
+/// reranking" independent of how candidates are found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RerankStore {
+    /// No rerank store. Refinement reads originals from the source parquet
+    /// (`refine_factor > 1`), or is skipped entirely (`refine_factor == 1`,
+    /// PQ-approx distances only). This is the default — it adds no storage.
+    None,
+    /// Scalar-quantized (int8) originals, ≈`dim` bytes/row (4× smaller than raw
+    /// f32). Refinement reads a contiguous byte range per candidate and reranks
+    /// with integer `l2_u8`. Near-exact recall at a quarter of the f32 footprint.
+    /// L2 / Cosine metrics only.
+    Sq8,
+    /// Full-precision (f32) originals, `dim * 4` bytes/row. Refinement reads a
+    /// contiguous byte range per candidate and reranks with exact f32 L2 —
+    /// recovering the recall SQ8 rounds away, at 4× SQ8's storage. Same
+    /// page-decode-free read path as SQ8; the only difference is precision vs
+    /// footprint. L2 / Cosine metrics only.
+    Flat,
+}
+
+impl Default for RerankStore {
+    fn default() -> Self {
+        RerankStore::None
+    }
+}
+
 /// Configuration for [`super::ExternalIvfPqIndex::build`].
 ///
 /// Use [`Self::builder`]; defaults match Lance's normal IVF-PQ defaults.
@@ -24,6 +61,8 @@ pub struct ExternalIvfPqIndexParams {
     pub sample_rate: usize,
     /// RNG seed (kmeans + PQ training).
     pub seed: u64,
+    /// Optional co-located rerank store. Default [`RerankStore::None`].
+    pub rerank_store: RerankStore,
 }
 
 impl ExternalIvfPqIndexParams {
@@ -41,6 +80,7 @@ pub struct ExternalIvfPqIndexParamsBuilder {
     max_iters: usize,
     sample_rate: usize,
     seed: u64,
+    rerank_store: RerankStore,
 }
 
 impl Default for ExternalIvfPqIndexParamsBuilder {
@@ -54,6 +94,7 @@ impl Default for ExternalIvfPqIndexParamsBuilder {
             max_iters: 50,
             sample_rate: 256,
             seed: 0xCAFE_BABE_DEAD_BEEF,
+            rerank_store: RerankStore::None,
         }
     }
 }
@@ -87,6 +128,11 @@ impl ExternalIvfPqIndexParamsBuilder {
         self.seed = s;
         self
     }
+    /// Enable a co-located rerank store. Default [`RerankStore::None`].
+    pub fn rerank_store(mut self, store: RerankStore) -> Self {
+        self.rerank_store = store;
+        self
+    }
 
     pub fn build(self) -> ExternalIvfPqIndexParams {
         ExternalIvfPqIndexParams {
@@ -97,6 +143,7 @@ impl ExternalIvfPqIndexParamsBuilder {
             max_iters: self.max_iters,
             sample_rate: self.sample_rate,
             seed: self.seed,
+            rerank_store: self.rerank_store,
         }
     }
 }

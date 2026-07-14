@@ -40,6 +40,44 @@ public final class ExternalIvfPqIndexParams {
     }
   }
 
+  /**
+   * Optional co-located rerank store written alongside the index. Mirrors {@code
+   * lance::index::vector::external::RerankStore}.
+   *
+   * <p>The IVF-PQ index persists only PQ codes (~16 B/row); refinement otherwise re-reads the
+   * original vectors from the source parquet, which page-decodes a multi-MB data page per scattered
+   * candidate row — the dominant per-query cost on wide (e.g. dim=1024) embeddings. A rerank store
+   * trades build-time storage for a contiguous, page-decode-free refine read.
+   */
+  public enum RerankStore {
+    /** No rerank store (default). Refinement reads originals from the source parquet. */
+    NONE,
+    /**
+     * Scalar-quantized (int8) originals, ~{@code dim} bytes/row (4x smaller than raw f32).
+     * Near-exact rerank at a quarter of the f32 footprint. L2 / Cosine metrics only.
+     */
+    SQ8,
+    /**
+     * Full-precision (f32) originals, {@code dim * 4} bytes/row. Exact-distance rerank — recovers
+     * the recall SQ8 rounds away, at 4x SQ8's storage. Same page-decode-free read path as SQ8. L2 /
+     * Cosine metrics only.
+     */
+    FLAT;
+
+    String toRustString() {
+      switch (this) {
+        case NONE:
+          return "None";
+        case SQ8:
+          return "Sq8";
+        case FLAT:
+          return "Flat";
+        default:
+          throw new IllegalStateException("unknown rerank store: " + this);
+      }
+    }
+  }
+
   private final int numPartitions;
   private final int numSubVectors;
   private final int numBitsPerSubVector;
@@ -47,6 +85,7 @@ public final class ExternalIvfPqIndexParams {
   private final int maxIters;
   private final int sampleRate;
   private final long seed;
+  private final RerankStore rerankStore;
 
   private ExternalIvfPqIndexParams(Builder b) {
     this.numPartitions = b.numPartitions;
@@ -56,6 +95,7 @@ public final class ExternalIvfPqIndexParams {
     this.maxIters = b.maxIters;
     this.sampleRate = b.sampleRate;
     this.seed = b.seed;
+    this.rerankStore = b.rerankStore;
   }
 
   public int getNumPartitions() {
@@ -86,6 +126,10 @@ public final class ExternalIvfPqIndexParams {
     return seed;
   }
 
+  public RerankStore getRerankStore() {
+    return rerankStore;
+  }
+
   public static Builder builder() {
     return new Builder();
   }
@@ -98,6 +142,7 @@ public final class ExternalIvfPqIndexParams {
     private int maxIters = 50;
     private int sampleRate = 256;
     private long seed = 0xCAFEBABEDEADBEEFL;
+    private RerankStore rerankStore = RerankStore.NONE;
 
     public Builder numPartitions(int n) {
       this.numPartitions = n;
@@ -131,6 +176,12 @@ public final class ExternalIvfPqIndexParams {
 
     public Builder seed(long seed) {
       this.seed = seed;
+      return this;
+    }
+
+    /** Enable a co-located rerank store. Default {@link RerankStore#NONE}. */
+    public Builder rerankStore(RerankStore rerankStore) {
+      this.rerankStore = rerankStore;
       return this;
     }
 

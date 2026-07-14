@@ -26,11 +26,15 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
-use super::manifest::{ExternalIndexManifest, write_manifest};
-use super::params::ExternalIvfPqIndexParams;
+use super::manifest::{ExternalIndexManifest, RerankStoreMeta, write_manifest};
+use super::params::{ExternalIvfPqIndexParams, RerankStore};
 use super::parquet_source::ParquetVectorSource;
+use super::rerank;
+use super::rerank::build_store;
 use super::types::ParquetFileSpec;
 use crate::index::vector::ivf::write_ivf_pq_file_external;
+use lance_index::vector::sq::ScalarQuantizer;
+use lance_linalg::distance::MetricType;
 
 /// Internal entry point — drives the full build pipeline.
 ///
@@ -57,11 +61,11 @@ pub(super) async fn build_index(
         ));
     }
 
-    let source = ParquetVectorSource::try_new(files.clone(), vector_column)?;
+    let source = ParquetVectorSource::try_new(files.clone(), vector_column).await?;
 
     // 1. Train kmeans for IVF centroids
     let sample_size = (params.num_partitions * params.sample_rate)
-        .min(source.num_rows()? as usize)
+        .min(source.num_rows().await? as usize)
         .max(params.num_partitions);
     let training = source.sample(sample_size).await?;
     let kmeans = KMeans::new(&training, params.num_partitions, params.max_iters as u32)
@@ -85,7 +89,7 @@ pub(super) async fn build_index(
         pq.clone(),
         None,
     ));
-    let raw_stream = source.iter_batches()?;
+    let raw_stream = source.iter_batches().await?;
     let partitioned_streams = shuffle_dataset(
         raw_stream,
         transformer,
@@ -118,24 +122,67 @@ pub(super) async fn build_index(
     .await?;
 
     // Resolve any unfilled num_rows on the file specs from their footers so the
-    // manifest records authoritative values.
+    // manifest records authoritative values. The rerank store's global-ordinal
+    // layout depends on these counts, so they must be authoritative before it
+    // (or the manifest) is written.
     let mut resolved_files = files;
     for spec in resolved_files.iter_mut() {
         if spec.num_rows == 0 {
-            spec.num_rows = read_parquet_num_rows(&spec.file_path)?;
+            spec.num_rows = read_parquet_num_rows(&spec.file_path).await?;
         }
     }
-    let manifest = ExternalIndexManifest::from_build(vector_column, &resolved_files, &params);
+
+    // Optionally build the co-located rerank store. For SQ8, bounds are learned
+    // from the same training sample already used for kmeans/PQ (no extra sampling
+    // pass); Flat needs no bounds. Either way the store is written from a full scan
+    // in manifest order, giving the row-major-by-global-ordinal layout the search
+    // path maps rids onto.
+    let rerank_kind = match params.rerank_store {
+        RerankStore::None => None,
+        RerankStore::Sq8 => Some(rerank::RerankKind::Sq8),
+        RerankStore::Flat => Some(rerank::RerankKind::Flat),
+    };
+    let rerank_meta: Option<RerankStoreMeta> = match rerank_kind {
+        None => None,
+        Some(kind) => {
+            if matches!(params.metric, MetricType::Dot) {
+                return Err(Error::invalid_input(
+                    "rerank store supports L2 / Cosine metrics only, not Dot",
+                ));
+            }
+            let dim = training.value_length() as usize;
+            // Bounds are only meaningful for SQ8; learn them from the training
+            // sample. Flat ignores them.
+            let bounds = match kind {
+                rerank::RerankKind::Sq8 => {
+                    let mut sq = ScalarQuantizer::new(8, dim);
+                    sq.update_bounds::<arrow::datatypes::Float32Type>(&training)?;
+                    sq.bounds()
+                }
+                rerank::RerankKind::Flat => 0.0..0.0,
+            };
+            let meta = build_store(
+                &object_store,
+                &index_dir,
+                &resolved_files,
+                vector_column,
+                dim,
+                kind,
+                bounds,
+            )
+            .await?;
+            Some(meta)
+        }
+    };
+
+    let manifest =
+        ExternalIndexManifest::from_build(vector_column, &resolved_files, &params, rerank_meta);
     write_manifest(&object_store, &index_dir, &manifest).await?;
 
     Ok(index_uuid)
 }
 
-fn read_parquet_num_rows(path: &str) -> Result<u64> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::invalid_input(format!("failed to open {path}: {e}")))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| Error::invalid_input(format!("failed to read footer for {path}: {e}")))?;
+async fn read_parquet_num_rows(path: &str) -> Result<u64> {
+    let builder = super::parquet_source::open_parquet_async(path).await?;
     Ok(builder.metadata().file_metadata().num_rows() as u64)
 }
