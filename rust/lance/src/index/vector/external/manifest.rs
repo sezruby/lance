@@ -75,6 +75,23 @@ pub struct RerankStoreMeta {
     pub bounds_min: Option<f64>,
     #[serde(default)]
     pub bounds_max: Option<f64>,
+    /// Sidecar layout. Empty (`#[serde(default)]`) → the single-file layout: one
+    /// `<index_dir>/<kind.file_name()>` covering all `total_rows` in global-ordinal
+    /// order (what the driver-side build writes). Non-empty → a distributed build
+    /// wrote one shard file per executor; each entry covers a contiguous global
+    /// ordinal range `[ordinal_base, ordinal_base + ordinal_count)`. The reader
+    /// routes each candidate ordinal to the shard whose range contains it.
+    #[serde(default)]
+    pub shards: Vec<RerankShard>,
+}
+
+/// One shard file of a distributed rerank sidecar, covering a contiguous global
+/// ordinal range. `path` is a full URI (executors write to shared storage).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RerankShard {
+    pub path: String,
+    pub ordinal_base: u64,
+    pub ordinal_count: u64,
 }
 
 impl RerankStoreMeta {
@@ -84,6 +101,12 @@ impl RerankStoreMeta {
             "flat" => self.dim * 4,
             _ => self.dim, // sq8: one u8 per dim
         }
+    }
+
+    /// True when the sidecar is split into per-executor shard files (distributed
+    /// build) rather than a single driver-written file.
+    pub fn is_sharded(&self) -> bool {
+        !self.shards.is_empty()
     }
 }
 
@@ -258,6 +281,7 @@ mod tests {
             total_rows: 10,
             bounds_min: Some(-1.5),
             bounds_max: Some(2.5),
+            shards: Vec::new(),
         });
         let manifest = ExternalIndexManifest::from_build("emb", &files, &params, rerank);
         let json = serde_json::to_vec_pretty(&manifest).unwrap();
@@ -269,6 +293,7 @@ mod tests {
         assert_eq!(r.bounds_min, Some(-1.5));
         assert_eq!(r.bounds_max, Some(2.5));
         assert_eq!(r.bytes_per_row(), 8); // sq8: one u8 per dim
+        assert!(!r.is_sharded());
 
         // A "flat" store: full-precision, no bounds, dim*4 bytes/row.
         let flat = RerankStoreMeta {
@@ -277,6 +302,7 @@ mod tests {
             total_rows: 10,
             bounds_min: None,
             bounds_max: None,
+            shards: Vec::new(),
         };
         assert_eq!(flat.bytes_per_row(), 32);
 

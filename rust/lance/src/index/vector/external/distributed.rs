@@ -64,7 +64,8 @@ impl BroadcastPayload {
     /// all little-endian. Round-trips via [`Self::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let metric = format!("{}", self.metric);
-        let mut out = Vec::with_capacity(4 + metric.len() + 16 + self.ivf_pb.len() + self.pq_pb.len());
+        let mut out =
+            Vec::with_capacity(4 + metric.len() + 16 + self.ivf_pb.len() + self.pq_pb.len());
         out.extend_from_slice(&(metric.len() as u32).to_le_bytes());
         out.extend_from_slice(metric.as_bytes());
         out.extend_from_slice(&(self.ivf_pb.len() as u64).to_le_bytes());
@@ -205,18 +206,48 @@ pub async fn merge_shards(
     .await
 }
 
-/// URI-based wrapper over [`merge_shards`] for the JNI/Spark layer: resolves
-/// `index_uri` into its object store + path internally so callers pass only
-/// strings. `index_uri` is the full path to the `index.idx` to write (the caller
-/// composes `<dir>/<uuid>/index.idx` and writes the manifest alongside).
-pub async fn merge_shards_to_uri(
+/// Driver phase 3, complete: merge the shard parquets into `<index_dir>/index.idx`
+/// AND write `<index_dir>/manifest.json`, leaving a directory that
+/// [`super::ExternalIvfPqIndex::open`] can open directly. This is the JNI/Spark
+/// entry point — the caller passes the index directory URI plus the full sorted
+/// file list (whose position = each file's global `file_id`, matching the shard
+/// rids) and the build params.
+///
+/// `file_paths` must be in the SAME sorted order the shards were built against, so
+/// the manifest's `file_id → path` mapping agrees with the merged rids.
+pub async fn merge_shards_to_index(
     payload: &BroadcastPayload,
     shard_uris: &[String],
+    file_paths: &[String],
     vector_column: &str,
-    index_uri: &str,
+    index_dir_uri: &str,
+    params: &ExternalIvfPqIndexParams,
 ) -> Result<()> {
-    let (object_store, index_path) = ObjectStore::from_uri(index_uri).await?;
-    merge_shards(payload, shard_uris, vector_column, &index_path, &object_store).await
+    let (object_store, index_dir) = ObjectStore::from_uri(index_dir_uri).await?;
+    let index_path = index_dir.child(super::open::INDEX_FILE_NAME);
+    merge_shards(
+        payload,
+        shard_uris,
+        vector_column,
+        &index_path,
+        &object_store,
+    )
+    .await?;
+
+    // Build the manifest so open() finds it next to index.idx. Resolve num_rows
+    // from each file's footer (the rerank sidecar's global-ordinal layout and the
+    // rid file_id mapping both depend on authoritative counts).
+    let mut specs: Vec<ParquetFileSpec> = file_paths.iter().map(ParquetFileSpec::of).collect();
+    for spec in specs.iter_mut() {
+        if spec.num_rows == 0 {
+            let b = super::parquet_source::open_parquet_async(&spec.file_path).await?;
+            spec.num_rows = b.metadata().file_metadata().num_rows() as u64;
+        }
+    }
+    // Distributed build does not yet produce a rerank sidecar (None recorded).
+    let manifest =
+        super::manifest::ExternalIndexManifest::from_build(vector_column, &specs, params, None);
+    super::manifest::write_manifest(&object_store, &index_dir, &manifest).await
 }
 
 // ---- shard parquet I/O -------------------------------------------------------
@@ -574,6 +605,278 @@ mod tests {
                 sd.intersection(&sr).count() >= K - 1,
                 "result sets diverge by more than one tie flip"
             );
+        }
+    }
+
+    /// A SHARDED SQ8 sidecar (multiple shard files, each a contiguous global-ordinal
+    /// range) must serve identical search results to a single-file SQ8 sidecar over
+    /// the same data — the sharded-reader routing (ordinal → segment → byte range)
+    /// is correct. Both indexes share one index.idx + one bounds; only the sidecar
+    /// layout differs (1 file vs N shard files), so results must be byte-identical.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sharded_sidecar_matches_single_file() {
+        use super::super::manifest::{ExternalIndexManifest, RerankShard, RerankStoreMeta};
+        use super::super::rerank::{RerankKind, build_store, build_store_shard};
+
+        const DIM: usize = 16;
+        const K: usize = 10;
+        const NUM_FILES: usize = 4;
+        const PER_FILE: usize = 300;
+
+        let data = TempDir::new().unwrap();
+        let files: Vec<ParquetFileSpec> = (0..NUM_FILES)
+            .map(|i| {
+                let p = data.path().join(format!("f{i}.parquet"));
+                write_parquet(&p, PER_FILE, DIM, 300 + i as u64);
+                ParquetFileSpec::of(p.to_str().unwrap())
+            })
+            .collect();
+        let params = ExternalIvfPqIndexParams::builder()
+            .num_partitions(4)
+            .num_sub_vectors(4)
+            .num_bits_per_sub_vector(8)
+            .metric(MetricType::L2)
+            .max_iters(10)
+            .sample_rate(80)
+            .rerank_store(super::super::params::RerankStore::Sq8)
+            .build();
+
+        // Fixed SQ8 bounds so both sidecars quantize identically (bounds are the
+        // only training-derived input to the sidecar).
+        let bounds = -1.0f64..1.0f64;
+
+        // Helper: build a whole-corpus index.idx from freshly-trained quantizers,
+        // returning (object_store, index_dir, resolved_files, total_rows).
+        async fn build_index_only(
+            files: &[ParquetFileSpec],
+            params: &ExternalIvfPqIndexParams,
+            out: &TempDir,
+        ) -> (
+            std::sync::Arc<ObjectStore>,
+            object_store::path::Path,
+            Vec<ParquetFileSpec>,
+            u64,
+            uuid::Uuid,
+        ) {
+            let src = ParquetVectorSource::try_new(files.to_vec(), "vec")
+                .await
+                .unwrap();
+            let (ivf, pq, _t) = super::super::build::train_quantizers(&src, params)
+                .await
+                .unwrap();
+            let groups =
+                super::super::build::shard_partition_streams(&src, "vec", &ivf, &pq, params)
+                    .await
+                    .unwrap();
+            let (os, root) = ObjectStore::from_uri(out.path().to_str().unwrap())
+                .await
+                .unwrap();
+            let uuid = uuid::Uuid::new_v4();
+            let dir = root.child(uuid.to_string());
+            let index_path = dir.child(super::super::open::INDEX_FILE_NAME);
+            let streams: Vec<_> = groups
+                .into_iter()
+                .filter(|g| !g.is_empty())
+                .map(|b| futures::stream::iter(b.into_iter().map(Ok::<_, Error>)))
+                .collect();
+            crate::index::vector::ivf::write_ivf_pq_file_external(
+                &os,
+                &index_path,
+                "vec",
+                "external_ivf_pq",
+                0,
+                ivf,
+                pq,
+                streams,
+            )
+            .await
+            .unwrap();
+            let mut resolved = files.to_vec();
+            let mut total = 0u64;
+            for s in resolved.iter_mut() {
+                if s.num_rows == 0 {
+                    let b = super::super::parquet_source::open_parquet_async(&s.file_path)
+                        .await
+                        .unwrap();
+                    s.num_rows = b.metadata().file_metadata().num_rows() as u64;
+                }
+                total += s.num_rows;
+            }
+            (os, dir, resolved, total, uuid)
+        }
+
+        // (A) single-file sidecar.
+        let out_a = TempDir::new().unwrap();
+        let (os_a, dir_a, resolved_a, _total_a, uuid_a) =
+            build_index_only(&files, &params, &out_a).await;
+        let meta_a = build_store(
+            &os_a,
+            &dir_a,
+            &resolved_a,
+            "vec",
+            DIM,
+            RerankKind::Sq8,
+            bounds.clone(),
+        )
+        .await
+        .unwrap();
+        let manifest_a =
+            ExternalIndexManifest::from_build("vec", &resolved_a, &params, Some(meta_a));
+        super::super::manifest::write_manifest(&os_a, &dir_a, &manifest_a)
+            .await
+            .unwrap();
+
+        // (B) sharded sidecar: 2 shards, each covering 2 files' contiguous ordinals.
+        let out_b = TempDir::new().unwrap();
+        let (os_b, dir_b, resolved_b, total_b, uuid_b) =
+            build_index_only(&files, &params, &out_b).await;
+        // Shard boundaries: files [0,1] and [2,3]. ordinal_base = prefix-sum of rows.
+        let mid = 2usize;
+        let base0 = 0u64;
+        let base1: u64 = resolved_b[..mid].iter().map(|s| s.num_rows).sum();
+        let shard0_uri = format!(
+            "{}/rerank-shard0.sq8",
+            out_b.path().join(uuid_b.to_string()).to_str().unwrap()
+        );
+        let shard1_uri = format!(
+            "{}/rerank-shard1.sq8",
+            out_b.path().join(uuid_b.to_string()).to_str().unwrap()
+        );
+        let (s0store, s0path) = ObjectStore::from_uri(&shard0_uri).await.unwrap();
+        let c0 = build_store_shard(
+            &s0store,
+            &s0path,
+            &resolved_b[..mid],
+            "vec",
+            DIM,
+            RerankKind::Sq8,
+            bounds.clone(),
+        )
+        .await
+        .unwrap();
+        let (s1store, s1path) = ObjectStore::from_uri(&shard1_uri).await.unwrap();
+        let c1 = build_store_shard(
+            &s1store,
+            &s1path,
+            &resolved_b[mid..],
+            "vec",
+            DIM,
+            RerankKind::Sq8,
+            bounds.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c0 + c1, total_b, "shard rows must cover all rows");
+        let meta_b = RerankStoreMeta {
+            kind: "sq8".to_string(),
+            dim: DIM,
+            total_rows: total_b,
+            bounds_min: Some(bounds.start),
+            bounds_max: Some(bounds.end),
+            shards: vec![
+                RerankShard {
+                    path: shard0_uri,
+                    ordinal_base: base0,
+                    ordinal_count: c0,
+                },
+                RerankShard {
+                    path: shard1_uri,
+                    ordinal_base: base1,
+                    ordinal_count: c1,
+                },
+            ],
+        };
+        let manifest_b =
+            ExternalIndexManifest::from_build("vec", &resolved_b, &params, Some(meta_b));
+        super::super::manifest::write_manifest(&os_b, &dir_b, &manifest_b)
+            .await
+            .unwrap();
+
+        // Both index.idx were trained separately (kmeans nondeterministic), so we do
+        // NOT compare A vs B to each other. Instead assert each opens and that the
+        // SHARDED one (B) returns results consistent with its OWN single-file control:
+        // rebuild B's sidecar single-file from the same index and compare.
+        let idx_b_sharded =
+            ExternalIvfPqIndex::open(out_b.path().join(uuid_b.to_string()).to_str().unwrap())
+                .await
+                .expect("open sharded");
+        // Control: a single-file sidecar over the SAME index dir B (overwrite meta).
+        let meta_b_single = build_store(
+            &os_b,
+            &dir_b,
+            &resolved_b,
+            "vec",
+            DIM,
+            RerankKind::Sq8,
+            bounds.clone(),
+        )
+        .await
+        .unwrap();
+        let out_b2 = TempDir::new().unwrap();
+        // Copy index.idx into a fresh dir with the single-file sidecar + manifest.
+        // Simpler: write a single-file manifest into a sibling dir reusing B's index
+        // is awkward; instead re-open B after replacing its manifest with single-file.
+        let manifest_b_single =
+            ExternalIndexManifest::from_build("vec", &resolved_b, &params, Some(meta_b_single));
+        let (os_b2, root_b2) = ObjectStore::from_uri(out_b2.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let dir_b2 = root_b2.child(uuid_b.to_string());
+        // Copy index.idx bytes B → B2.
+        let idx_bytes = os_b
+            .read_one_all(&dir_b.child(super::super::open::INDEX_FILE_NAME))
+            .await
+            .unwrap();
+        os_b2
+            .put(
+                &dir_b2.child(super::super::open::INDEX_FILE_NAME),
+                &idx_bytes,
+            )
+            .await
+            .unwrap();
+        // Single-file sidecar lives at dir_b2/<kind file>; build it there.
+        let _ = build_store(
+            &os_b2,
+            &dir_b2,
+            &resolved_b,
+            "vec",
+            DIM,
+            RerankKind::Sq8,
+            bounds.clone(),
+        )
+        .await
+        .unwrap();
+        super::super::manifest::write_manifest(&os_b2, &dir_b2, &manifest_b_single)
+            .await
+            .unwrap();
+        let idx_b_single =
+            ExternalIvfPqIndex::open(out_b2.path().join(uuid_b.to_string()).to_str().unwrap())
+                .await
+                .expect("open single control");
+        // The (A) path above independently exercises a from-scratch single-file
+        // sidecar build + manifest write; keep the bindings referenced.
+        let _ = (manifest_a, uuid_a, &dir_a);
+
+        let mut rng = StdRng::seed_from_u64(11);
+        for _ in 0..32 {
+            let q: Vec<f32> = (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let rs = idx_b_sharded
+                .search(&q, K, 4, 4, None)
+                .await
+                .expect("sharded search");
+            let rc = idx_b_single
+                .search(&q, K, 4, 4, None)
+                .await
+                .expect("single search");
+            assert_eq!(rs.len(), rc.len(), "result count differs");
+            for (a, b) in rs.iter().zip(rc.iter()) {
+                assert_eq!(
+                    a.file_path, b.file_path,
+                    "file_path differs (sharded vs single sidecar)"
+                );
+                assert_eq!(a.row_index, b.row_index, "row_index differs");
+                assert!((a.distance - b.distance).abs() < 1e-4, "distance differs");
+            }
         }
     }
 }

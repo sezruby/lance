@@ -184,7 +184,77 @@ pub(super) async fn build_store(
         total_rows,
         bounds_min,
         bounds_max,
+        shards: Vec::new(), // single-file layout
     })
+}
+
+/// Distributed sidecar: encode this shard's `files` and write them to `shard_uri`
+/// as one contiguous run of `bytes_per_row`-sized rows, in the files' given order.
+/// Returns the number of rows written (the shard's `ordinal_count`). The caller
+/// records `(shard_uri, ordinal_base, count)` in the manifest; `ordinal_base` is
+/// the global ordinal of this shard's first file, so the shards tile the global
+/// ordinal space exactly (same layout the single-file store has, just split).
+///
+/// Runs on an executor beside the index shard build — the same 40+ GB scan feeds
+/// both, so distributing the index build and leaving the sidecar on the driver
+/// would re-read the corpus; this keeps the whole scan distributed.
+pub(super) async fn build_store_shard(
+    object_store: &ObjectStore,
+    shard_uri: &Path,
+    files: &[super::types::ParquetFileSpec],
+    vector_column: &str,
+    dim: usize,
+    kind: RerankKind,
+    bounds: std::ops::Range<f64>,
+) -> Result<u64> {
+    let quantizer = match kind {
+        RerankKind::Sq8 => Some(ScalarQuantizer::with_bounds(SQ_NUM_BITS, dim, bounds)),
+        RerankKind::Flat => None,
+    };
+    let mut writer = object_store.create(shard_uri).await?;
+    let mut rows: u64 = 0;
+    for spec in files {
+        let builder = open_parquet_async(&spec.file_path).await?;
+        let projection = parquet_column_projection(&builder, vector_column)?;
+        let mut stream = builder
+            .with_projection(projection)
+            .with_batch_size(8192)
+            .build()
+            .map_err(|e| {
+                Error::invalid_input(format!("rerank shard: reader {}: {e}", spec.file_path))
+            })?;
+        while let Some(batch) = stream.try_next().await.map_err(|e| {
+            Error::invalid_input(format!("rerank shard: read {}: {e}", spec.file_path))
+        })? {
+            let col = batch.column_by_name(vector_column).ok_or_else(|| {
+                Error::invalid_input(format!("rerank shard: column '{vector_column}' missing"))
+            })?;
+            let fsl = coerce_to_fsl(col, dim)?;
+            match &quantizer {
+                Some(q) => {
+                    let codes = q.transform::<arrow::datatypes::Float32Type>(&fsl)?;
+                    writer
+                        .write_all(fixed_size_list_u8_values(&codes)?)
+                        .await
+                        .map_err(|e| Error::io(format!("rerank shard write: {e}")))?;
+                }
+                None => {
+                    let raw = fixed_size_list_f32_values(&fsl)?;
+                    let mut buf = Vec::with_capacity(raw.len() * 4);
+                    for v in raw {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                    writer
+                        .write_all(&buf)
+                        .await
+                        .map_err(|e| Error::io(format!("rerank shard write: {e}")))?;
+                }
+            }
+            rows += fsl.len() as u64;
+        }
+    }
+    Writer::shutdown(writer.as_mut()).await?;
+    Ok(rows)
 }
 
 /// The per-query query representation the reader compares stored rows against:
@@ -194,11 +264,23 @@ pub(super) enum QueryRepr {
     Flat(Vec<f32>),
 }
 
-/// Search-side reader over an opened rerank sidecar (sq8 or flat). Holds the
-/// object-store reader plus the decoded [`RerankStoreMeta`] so per-query
-/// refinement can map rids → byte ranges without re-parsing the manifest.
-pub(super) struct RerankReader {
+/// One opened sidecar segment: its object reader plus the global ordinal range it
+/// covers. A single-file sidecar is one segment `[0, total_rows)`; a distributed
+/// sidecar is one segment per shard. A global ordinal `o` lives in the segment
+/// whose `[base, base+count)` contains it, at byte offset `(o - base) * bpr`.
+struct Segment {
     reader: Arc<dyn Reader>,
+    base: u64,
+    count: u64,
+}
+
+/// Search-side reader over an opened rerank sidecar (sq8 or flat), single-file or
+/// sharded. Holds the segment readers + decoded [`RerankStoreMeta`] so per-query
+/// refinement maps global ordinals → (segment, byte range) without re-parsing the
+/// manifest.
+pub(super) struct RerankReader {
+    /// Segments sorted by `base`, tiling `[0, total_rows)` contiguously.
+    segments: Vec<Segment>,
     meta: RerankStoreMeta,
     kind: RerankKind,
     /// Quantizer rebuilt from the stored bounds (sq8 only). `None` for flat.
@@ -206,8 +288,9 @@ pub(super) struct RerankReader {
 }
 
 impl RerankReader {
-    /// Open the sidecar for `meta.kind` under `index_dir`. Cheap — no store bytes are
-    /// read here beyond what `ObjectStore::open` needs; rows are fetched per query.
+    /// Open the sidecar for `meta.kind` under `index_dir`. Opens the single sidecar
+    /// file, or every shard file when the meta is sharded. Cheap — no store bytes
+    /// are read beyond what `ObjectStore::open` needs.
     pub(super) async fn open(
         object_store: &ObjectStore,
         index_dir: &Path,
@@ -215,8 +298,32 @@ impl RerankReader {
     ) -> Result<Self> {
         let kind = RerankKind::from_tag(&meta.kind)
             .ok_or_else(|| Error::index(format!("unknown rerank store kind '{}'", meta.kind)))?;
-        let path = index_dir.clone().join(kind.file_name());
-        let reader: Arc<dyn Reader> = Arc::from(object_store.open(&path).await?);
+
+        let mut segments: Vec<Segment> = if meta.is_sharded() {
+            // Distributed: open each shard by its recorded URI.
+            let mut segs = Vec::with_capacity(meta.shards.len());
+            for shard in &meta.shards {
+                let (shard_store, shard_path) = ObjectStore::from_uri(&shard.path).await?;
+                let reader: Arc<dyn Reader> = Arc::from(shard_store.open(&shard_path).await?);
+                segs.push(Segment {
+                    reader,
+                    base: shard.ordinal_base,
+                    count: shard.ordinal_count,
+                });
+            }
+            segs
+        } else {
+            // Single-file: one segment covering everything, at index_dir/<file>.
+            let path = index_dir.clone().join(kind.file_name());
+            let reader: Arc<dyn Reader> = Arc::from(object_store.open(&path).await?);
+            vec![Segment {
+                reader,
+                base: 0,
+                count: meta.total_rows,
+            }]
+        };
+        segments.sort_by_key(|s| s.base);
+
         let quantizer = match kind {
             RerankKind::Sq8 => {
                 let lo = meta.bounds_min.ok_or_else(|| {
@@ -230,7 +337,7 @@ impl RerankReader {
             RerankKind::Flat => None,
         };
         Ok(Self {
-            reader,
+            segments,
             meta,
             kind,
             quantizer,
@@ -244,12 +351,12 @@ impl RerankReader {
     /// Fetch the encoded rows for `ordinals` (global ordinals). Returns a map from
     /// ordinal → owned `bytes_per_row`-byte row, reading each distinct ordinal once.
     ///
-    /// Reads are issued per contiguous run: after sort+dedup, adjacent ordinals
-    /// collapse into a single `get_range`, so a candidate set that clusters (as IVF
-    /// candidates from the same partition tend to) costs far fewer round trips than
-    /// one-request-per-row.
+    /// Ordinals are grouped by the segment that owns them, then read per contiguous
+    /// run within a segment (one `get_range` per run) — so clustered candidates cost
+    /// few round trips, and a sharded sidecar reads each shard independently.
     pub(super) async fn fetch_codes(&self, ordinals: &[u64]) -> Result<HashMap<u64, Vec<u8>>> {
         let bpr = self.meta.bytes_per_row() as u64;
+        let bpr_usize = self.meta.bytes_per_row();
         let mut sorted: Vec<u64> = ordinals.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -265,17 +372,26 @@ impl RerankReader {
         let mut out: HashMap<u64, Vec<u8>> = HashMap::with_capacity(sorted.len());
         let mut i = 0usize;
         while i < sorted.len() {
-            // Extend a run of consecutive ordinals [run_start, j).
             let run_start = sorted[i];
+            // The segment owning run_start (segments are sorted, tiling contiguously).
+            let seg = self
+                .segments
+                .iter()
+                .find(|s| run_start >= s.base && run_start < s.base + s.count)
+                .ok_or_else(|| {
+                    Error::index(format!("rerank fetch: ordinal {run_start} in no shard"))
+                })?;
+            let seg_end = seg.base + seg.count;
+            // Extend a run of consecutive ordinals that stay within this segment.
             let mut j = i + 1;
-            while j < sorted.len() && sorted[j] == sorted[j - 1] + 1 {
+            while j < sorted.len() && sorted[j] == sorted[j - 1] + 1 && sorted[j] < seg_end {
                 j += 1;
             }
-            let run_end = sorted[j - 1] + 1; // exclusive
-            let byte_start = (run_start * bpr) as usize;
-            let byte_end = (run_end * bpr) as usize;
-            let bytes = self.reader.get_range(byte_start..byte_end).await?;
-            let bpr_usize = self.meta.bytes_per_row();
+            let run_end = sorted[j - 1] + 1; // exclusive, global
+            // Byte offsets are relative to the segment's start.
+            let byte_start = ((run_start - seg.base) * bpr) as usize;
+            let byte_end = ((run_end - seg.base) * bpr) as usize;
+            let bytes = seg.reader.get_range(byte_start..byte_end).await?;
             for (k, ord) in (run_start..run_end).enumerate() {
                 let off = k * bpr_usize;
                 out.insert(ord, bytes[off..off + bpr_usize].to_vec());
