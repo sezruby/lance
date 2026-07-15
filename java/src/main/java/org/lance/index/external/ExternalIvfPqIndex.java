@@ -232,14 +232,18 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
    *     row}, so shards built on separate executors carry globally-consistent ids and merge
    *     correctly.
    */
-  public static void buildShard(
+  /**
+   * @return the sidecar shard's row count (0 when no rerank store). The sidecar file is written to
+   *     {@code shardUri + ".rerank"}; the driver prefix-sums these counts into the manifest.
+   */
+  public static long buildShard(
       byte[] broadcastPayload,
       List<String> shardFiles,
       String vectorColumn,
       int fileIdOffset,
       String shardUri,
       ExternalIvfPqIndexParams params) {
-    nativeBuildShard(
+    return nativeBuildShard(
         broadcastPayload,
         shardFiles.toArray(new String[0]),
         vectorColumn,
@@ -256,13 +260,38 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
   }
 
   /**
-   * Distributed-build phase 3 (driver): merge the per-executor shard outputs into the final index
-   * file. {@code indexUri} is the full path to write (e.g. {@code <dir>/<uuid>/index.idx}); the
-   * caller writes {@code manifest.json} alongside.
+   * Distributed-build phase 3 (driver): merge the per-executor shard outputs into {@code
+   * indexDirUri/index.idx} and write {@code manifest.json} alongside, leaving a directory {@link
+   * #open} can open directly.
+   *
+   * @param filePaths the FULL sorted file list (position = each file's global file_id, matching the
+   *     shard rids); used to write the manifest's file_id→path mapping.
    */
   public static void mergeShards(
-      byte[] broadcastPayload, List<String> shardUris, String vectorColumn, String indexUri) {
-    nativeMergeShards(broadcastPayload, shardUris.toArray(new String[0]), vectorColumn, indexUri);
+      byte[] broadcastPayload,
+      List<String> shardUris,
+      List<String> filePaths,
+      String vectorColumn,
+      String indexDirUri,
+      ExternalIvfPqIndexParams params,
+      List<String> sidecarUris,
+      long[] sidecarRows) {
+    nativeMergeShards(
+        broadcastPayload,
+        shardUris.toArray(new String[0]),
+        filePaths.toArray(new String[0]),
+        vectorColumn,
+        indexDirUri,
+        params.getNumPartitions(),
+        params.getNumSubVectors(),
+        params.getNumBitsPerSubVector(),
+        params.getMetric().toRustString(),
+        params.getMaxIters(),
+        params.getSampleRate(),
+        params.getSeed(),
+        params.getRerankStore().toRustString(),
+        sidecarUris.toArray(new String[0]),
+        sidecarRows);
   }
 
   // ---- native methods -------------------------------------------------------
@@ -279,7 +308,7 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
       long seed,
       String rerankStore);
 
-  private static native void nativeBuildShard(
+  private static native long nativeBuildShard(
       byte[] broadcastPayload,
       String[] shardFiles,
       String vectorColumn,
@@ -295,7 +324,21 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
       String rerankStore);
 
   private static native void nativeMergeShards(
-      byte[] broadcastPayload, String[] shardUris, String vectorColumn, String indexUri);
+      byte[] broadcastPayload,
+      String[] shardUris,
+      String[] filePaths,
+      String vectorColumn,
+      String indexDirUri,
+      int numPartitions,
+      int numSubVectors,
+      int numBitsPerSubVector,
+      String metric,
+      int maxIters,
+      int sampleRate,
+      long seed,
+      String rerankStore,
+      String[] sidecarUris,
+      long[] sidecarRows);
 
   private static native String nativeBuild(
       String[] filePaths,

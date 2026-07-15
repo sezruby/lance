@@ -295,8 +295,11 @@ pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeTr
 
 /// Executor phase 2: build one file shard's partition output to `shard_uri` using
 /// the broadcast payload. `file_id_offset` is the global position of this shard's
-/// first file in the full sorted file list.
+/// first file in the full sorted file list. Returns the sidecar shard's row count
+/// (0 when no rerank store) so the driver can prefix-sum ordinal bases; the sidecar
+/// itself is written to `<shard_uri>.rerank`.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeBuildShard<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -313,14 +316,78 @@ pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeBu
     sample_rate: jint,
     seed: jlong,
     rerank_store: JString<'local>,
+) -> jlong {
+    let result = (|| -> Result<i64> {
+        let payload = payload_from_jbytes(&mut env, &payload_bytes)?;
+        let paths = extract_string_array(&mut env, &file_paths)?;
+        let files: Vec<ParquetFileSpec> = paths.into_iter().map(ParquetFileSpec::of).collect();
+        let vector_column_str: String = vector_column.extract(&mut env)?;
+        let shard_uri_str: String = shard_uri.extract(&mut env)?;
+        let params = params_from_args(
+            &mut env,
+            num_partitions,
+            num_sub_vectors,
+            num_bits_per_sub_vector,
+            metric,
+            max_iters,
+            sample_rate,
+            seed,
+            rerank_store,
+        )?;
+        let res = RT.block_on(async move {
+            lance::index::vector::external::build_shard_to_parquet(
+                &payload,
+                files,
+                &vector_column_str,
+                file_id_offset as u32,
+                &params,
+                &shard_uri_str,
+            )
+            .await
+        })?;
+        Ok(res.sidecar.map(|s| s.rows as i64).unwrap_or(0))
+    })();
+    match result {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            0
+        }
+    }
+}
+
+/// Driver phase 3: merge shard parquets into `<index_dir_uri>/index.idx` and write
+/// `manifest.json` alongside, leaving an openable index directory. `file_paths` is
+/// the full sorted file list (position = global file_id, matching the shard rids).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeMergeShards<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    payload_bytes: JByteArray<'local>,
+    shard_uris: JObjectArray<'local>,
+    file_paths: JObjectArray<'local>,
+    vector_column: JString<'local>,
+    index_dir_uri: JString<'local>,
+    num_partitions: jint,
+    num_sub_vectors: jint,
+    num_bits_per_sub_vector: jint,
+    metric: JString<'local>,
+    max_iters: jint,
+    sample_rate: jint,
+    seed: jlong,
+    rerank_store: JString<'local>,
+    // Sidecar shards in global file order (parallel arrays); empty when no store.
+    sidecar_uris: JObjectArray<'local>,
+    sidecar_rows: jlongArray,
 ) {
     ok_or_throw_without_return!(env, {
         (|| -> Result<()> {
             let payload = payload_from_jbytes(&mut env, &payload_bytes)?;
+            let uris = extract_string_array(&mut env, &shard_uris)?;
             let paths = extract_string_array(&mut env, &file_paths)?;
-            let files: Vec<ParquetFileSpec> = paths.into_iter().map(ParquetFileSpec::of).collect();
             let vector_column_str: String = vector_column.extract(&mut env)?;
-            let shard_uri_str: String = shard_uri.extract(&mut env)?;
+            let index_dir_str: String = index_dir_uri.extract(&mut env)?;
             let params = params_from_args(
                 &mut env,
                 num_partitions,
@@ -332,44 +399,30 @@ pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeBu
                 seed,
                 rerank_store,
             )?;
+            // Zip sidecar (uri, rows) parallel arrays.
+            let sc_uris = extract_string_array(&mut env, &sidecar_uris)?;
+            let sidecar_shards: Vec<(String, u64)> = if sc_uris.is_empty() {
+                Vec::new()
+            } else {
+                let arr = unsafe { jni::objects::JLongArray::from_raw(sidecar_rows) };
+                let len = env.get_array_length(&arr)? as usize;
+                let mut rows = vec![0i64; len];
+                env.get_long_array_region(&arr, 0, &mut rows)?;
+                sc_uris
+                    .into_iter()
+                    .zip(rows.into_iter())
+                    .map(|(u, r)| (u, r as u64))
+                    .collect()
+            };
             RT.block_on(async move {
-                lance::index::vector::external::build_shard_to_parquet(
-                    &payload,
-                    files,
-                    &vector_column_str,
-                    file_id_offset as u32,
-                    &params,
-                    &shard_uri_str,
-                )
-                .await
-            })?;
-            Ok(())
-        })()
-    });
-}
-
-/// Driver phase 3: merge shard parquets into `index_uri` (`<dir>/<uuid>/index.idx`).
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeMergeShards<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    payload_bytes: JByteArray<'local>,
-    shard_uris: JObjectArray<'local>,
-    vector_column: JString<'local>,
-    index_uri: JString<'local>,
-) {
-    ok_or_throw_without_return!(env, {
-        (|| -> Result<()> {
-            let payload = payload_from_jbytes(&mut env, &payload_bytes)?;
-            let uris = extract_string_array(&mut env, &shard_uris)?;
-            let vector_column_str: String = vector_column.extract(&mut env)?;
-            let index_uri_str: String = index_uri.extract(&mut env)?;
-            RT.block_on(async move {
-                lance::index::vector::external::merge_shards_to_uri(
+                lance::index::vector::external::merge_shards_to_index(
                     &payload,
                     &uris,
+                    &paths,
                     &vector_column_str,
-                    &index_uri_str,
+                    &index_dir_str,
+                    &params,
+                    &sidecar_shards,
                 )
                 .await
             })?;

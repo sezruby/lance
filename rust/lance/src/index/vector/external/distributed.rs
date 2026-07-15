@@ -56,6 +56,12 @@ pub struct BroadcastPayload {
     pub ivf_pb: Vec<u8>,
     pub pq_pb: Vec<u8>,
     pub metric: MetricType,
+    /// SQ8 quantization bounds `[min, max]` learned on the driver from the training
+    /// sample. Executors need the SAME bounds to encode their sidecar shards so all
+    /// shards (and the query at search time) share one code space. `(0,0)` when no
+    /// rerank store is requested (unused).
+    pub sq_bounds_min: f64,
+    pub sq_bounds_max: f64,
 }
 
 impl BroadcastPayload {
@@ -72,6 +78,8 @@ impl BroadcastPayload {
         out.extend_from_slice(&self.ivf_pb);
         out.extend_from_slice(&(self.pq_pb.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.pq_pb);
+        out.extend_from_slice(&self.sq_bounds_min.to_le_bytes());
+        out.extend_from_slice(&self.sq_bounds_max.to_le_bytes());
         out
     }
 
@@ -103,10 +111,14 @@ impl BroadcastPayload {
         let ivf_pb = take(&mut pos, ilen)?.to_vec();
         let plen = u64::from_le_bytes(take(&mut pos, 8)?.try_into().map_err(|_| err())?) as usize;
         let pq_pb = take(&mut pos, plen)?.to_vec();
+        let sq_bounds_min = f64::from_le_bytes(take(&mut pos, 8)?.try_into().map_err(|_| err())?);
+        let sq_bounds_max = f64::from_le_bytes(take(&mut pos, 8)?.try_into().map_err(|_| err())?);
         Ok(Self {
             ivf_pb,
             pq_pb,
             metric,
+            sq_bounds_min,
+            sq_bounds_max,
         })
     }
 
@@ -131,13 +143,32 @@ pub async fn train_broadcast_payload(
     params: &ExternalIvfPqIndexParams,
 ) -> Result<BroadcastPayload> {
     let source = ParquetVectorSource::try_new(files, vector_column).await?;
-    let (ivf, pq, _training) = super::build::train_quantizers(&source, params).await?;
+    let (ivf, pq, training) = super::build::train_quantizers(&source, params).await?;
     let ivf_pb = PbIvf::try_from(&ivf)?.encode_to_vec();
     let pq_pb = PbPq::try_from(&pq)?.encode_to_vec();
+
+    // Learn SQ8 bounds from the same training sample so executors encode their
+    // sidecar shards in one shared code space. Only meaningful for a rerank store;
+    // (0,0) otherwise (unused). Mirrors the driver-side build_index bounds step.
+    let (sq_bounds_min, sq_bounds_max) = if params.rerank_store
+        != super::params::RerankStore::None
+    {
+        use lance_index::vector::sq::ScalarQuantizer;
+        let dim = training.value_length() as usize;
+        let mut sq = ScalarQuantizer::new(8, dim);
+        sq.update_bounds::<arrow::datatypes::Float32Type>(&training)?;
+        let b = sq.bounds();
+        (b.start, b.end)
+    } else {
+        (0.0, 0.0)
+    };
+
     Ok(BroadcastPayload {
         ivf_pb,
         pq_pb,
         metric: params.metric,
+        sq_bounds_min,
+        sq_bounds_max,
     })
 }
 
@@ -157,16 +188,80 @@ pub async fn build_shard_to_parquet(
     file_id_offset: u32,
     params: &ExternalIvfPqIndexParams,
     shard_uri: &str,
-) -> Result<usize> {
+) -> Result<ShardResult> {
     let (ivf, pq) = payload.decode()?;
+
+    // If a rerank store is requested, emit this shard's sidecar in the SAME scan —
+    // the sidecar is written to `<shard_uri>.rerank` as one contiguous run of this
+    // shard's rows (row-major, matching the index shard's file order). `sidecar_rows`
+    // becomes the shard's `ordinal_count`; the driver prefix-sums the bases.
+    let sidecar = match params.rerank_store {
+        super::params::RerankStore::None => None,
+        store => {
+            let (kind, bounds) = match store {
+                super::params::RerankStore::Sq8 => (
+                    super::rerank::RerankKind::Sq8,
+                    payload.sq_bounds_min..payload.sq_bounds_max,
+                ),
+                super::params::RerankStore::Flat => {
+                    (super::rerank::RerankKind::Flat, 0.0..0.0)
+                }
+                super::params::RerankStore::None => unreachable!(),
+            };
+            if matches!(params.metric, MetricType::Dot) {
+                return Err(Error::invalid_input(
+                    "rerank store supports L2 / Cosine metrics only, not Dot",
+                ));
+            }
+            let dim = ivf.dimension();
+            let sidecar_uri = format!("{shard_uri}.rerank");
+            let (store_os, store_path) = ObjectStore::from_uri(&sidecar_uri).await?;
+            let rows = super::rerank::build_store_shard(
+                &store_os,
+                &store_path,
+                &files,
+                vector_column,
+                dim,
+                kind,
+                bounds,
+            )
+            .await?;
+            Some(SidecarShard {
+                uri: sidecar_uri,
+                rows,
+            })
+        }
+    };
+
     let source =
         ParquetVectorSource::try_new_with_offset(files, vector_column, file_id_offset).await?;
     let collected =
         super::build::shard_partition_streams(&source, vector_column, &ivf, &pq, params).await?;
-
     let num_groups = collected.len();
     write_shard_parquet(shard_uri, collected).await?;
-    Ok(num_groups)
+
+    Ok(ShardResult {
+        num_groups,
+        sidecar,
+    })
+}
+
+/// What one executor shard produced.
+#[derive(Clone, Debug)]
+pub struct ShardResult {
+    /// Non-empty partition groups in the index shard (diagnostic).
+    pub num_groups: usize,
+    /// The sidecar shard this executor wrote, if a rerank store was requested.
+    pub sidecar: Option<SidecarShard>,
+}
+
+/// A rerank sidecar shard written by an executor: its URI and row count. The
+/// driver assembles these (in file order) into the manifest's shard list, prefix-
+/// summing the counts to get each shard's `ordinal_base`.
+#[derive(Clone, Debug)]
+pub struct SidecarShard {
+    pub uri: String,
+    pub rows: u64,
 }
 
 /// Driver phase 3: read every shard's persisted partition output back, and
@@ -222,6 +317,10 @@ pub async fn merge_shards_to_index(
     vector_column: &str,
     index_dir_uri: &str,
     params: &ExternalIvfPqIndexParams,
+    // Sidecar shards in GLOBAL FILE ORDER (same order the file shards were built).
+    // `(uri, rows)`; the driver prefix-sums `rows` to derive each shard's
+    // `ordinal_base`. Empty when no rerank store was requested.
+    sidecar_shards: &[(String, u64)],
 ) -> Result<()> {
     let (object_store, index_dir) = ObjectStore::from_uri(index_dir_uri).await?;
     let index_path = index_dir.child(super::open::INDEX_FILE_NAME);
@@ -244,9 +343,46 @@ pub async fn merge_shards_to_index(
             spec.num_rows = b.metadata().file_metadata().num_rows() as u64;
         }
     }
-    // Distributed build does not yet produce a rerank sidecar (None recorded).
+
+    // Assemble the rerank meta from the sidecar shards, if any. Prefix-sum the
+    // per-shard row counts to get each shard's global ordinal base; the shards tile
+    // [0, total_rows) exactly (same layout as the single-file sidecar, split).
+    let rerank = if sidecar_shards.is_empty() {
+        None
+    } else {
+        let kind = match params.rerank_store {
+            super::params::RerankStore::Sq8 => "sq8",
+            super::params::RerankStore::Flat => "flat",
+            super::params::RerankStore::None => "sq8", // shouldn't happen if shards present
+        };
+        let dim = payload.decode()?.0.dimension();
+        let mut base = 0u64;
+        let mut shards = Vec::with_capacity(sidecar_shards.len());
+        for (uri, rows) in sidecar_shards {
+            shards.push(super::manifest::RerankShard {
+                path: uri.clone(),
+                ordinal_base: base,
+                ordinal_count: *rows,
+            });
+            base += *rows;
+        }
+        let (bmin, bmax) = if kind == "sq8" {
+            (Some(payload.sq_bounds_min), Some(payload.sq_bounds_max))
+        } else {
+            (None, None)
+        };
+        Some(super::manifest::RerankStoreMeta {
+            kind: kind.to_string(),
+            dim,
+            total_rows: base,
+            bounds_min: bmin,
+            bounds_max: bmax,
+            shards,
+        })
+    };
+
     let manifest =
-        super::manifest::ExternalIndexManifest::from_build(vector_column, &specs, params, None);
+        super::manifest::ExternalIndexManifest::from_build(vector_column, &specs, params, rerank);
     super::manifest::write_manifest(&object_store, &index_dir, &manifest).await
 }
 
