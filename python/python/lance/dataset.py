@@ -4555,6 +4555,46 @@ class LanceDataset(pa.dataset.Dataset):
             merged=merged,
         )
 
+    def commit_merge_transactions(
+        self, transactions: Sequence[Transaction]
+    ) -> "LanceDataset":
+        """Combine several uncommitted merge-insert transactions into one and commit it.
+
+        This is the driver-side step of a distributed merge: partition the merge source
+        across workers, run :meth:`MergeInsertBuilder.execute_uncommitted` on each worker
+        (each writes new data fragments but does not commit) and collect the returned
+        :class:`Transaction` objects, then pass them here. They are combined into a single
+        transaction — unioning the per-fragment deletion vectors — and committed atomically
+        against this dataset.
+
+        The source must have been partitioned by the merge key so that a given target row
+        is modified by at most one transaction; the deletion-vector union is then
+        unambiguous. Overlapping deletions (the same target row deleted by two transactions)
+        are rejected rather than silently committed.
+
+        Parameters
+        ----------
+        transactions: Sequence[Transaction]
+            The uncommitted merge transactions returned by
+            :meth:`MergeInsertBuilder.execute_uncommitted` on each worker.
+
+        Returns
+        -------
+        LanceDataset
+            A new dataset handle at the committed version.
+        """
+        new_ds = self._ds.commit_merge_transactions(list(transactions))
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._storage_options = self._storage_options
+        ds._base_store_params = getattr(self, "_base_store_params", None)
+        ds._namespace_client = None
+        ds._table_id = None
+        ds._default_scan_options = None
+        ds._read_params = None
+        return ds
+
     def validate(self):
         """
         Validate the dataset.

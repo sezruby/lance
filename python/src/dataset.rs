@@ -46,7 +46,7 @@ use lance::dataset::scanner::{
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
-    WriteDestination,
+    WriteDestination, combine_merge_transactions,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
@@ -2760,6 +2760,35 @@ impl Dataset {
         };
 
         Ok((ds, PyLance(res.merged)))
+    }
+
+    /// Combine several uncommitted merge-insert transactions (each from
+    /// :meth:`MergeInsertBuilder.execute_uncommitted` run on a separate worker) into one
+    /// transaction — unioning per-fragment deletion vectors — and commit it as a single operation.
+    ///
+    /// This is the driver-side step of a distributed merge: partition the source across workers,
+    /// run ``execute_uncommitted`` on each (writing new data fragments but not committing), collect
+    /// the returned transactions, and pass them here to combine + commit atomically. The source must
+    /// have been partitioned by the merge key so a given target row is modified by at most one
+    /// transaction (the deletion-vector union is then unambiguous); overlapping deletions are
+    /// rejected rather than silently committed.
+    fn commit_merge_transactions(
+        &self,
+        transactions: Vec<PyLance<Transaction>>,
+    ) -> PyResult<Self> {
+        let txns: Vec<Transaction> = transactions.into_iter().map(|t| t.0).collect();
+        let base = self.ds.clone();
+        let new_ds = rt()
+            .block_on(None, async move {
+                let combined = combine_merge_transactions(base.as_ref(), txns).await?;
+                CommitBuilder::new(base).execute(combined).await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let uri = new_ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(new_ds),
+            uri,
+        })
     }
 
     fn validate(&self) -> PyResult<()> {

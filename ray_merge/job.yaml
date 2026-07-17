@@ -1,0 +1,24 @@
+# Anyscale job: distributed lance merge over Ray.
+# Submit with:
+#   ANYSCALE_HOST=https://console.azure.anyscale.com \
+#   ANYSCALE_CLI_TOKEN=$(cat ~/.anyscalek) \
+#   anyscale job submit -f ray_merge/job.yaml
+#
+# Prereq: a linux pylance wheel built FROM THIS BRANCH (with commit_merge_transactions)
+# must be installed — either baked into a custom image or pip-installed via `pip` below.
+# For the first run we build the wheel on the cluster head (see run_on_workspace.sh).
+name: lance-distributed-merge
+entrypoint: >
+  python ray_merge/distributed_merge.py
+  --uri /mnt/cluster_storage/merge_target.lance
+  --target-rows 5000000
+  --source-frac 0.2
+  --workers 8
+  --max-rows-per-file 100000
+working_dir: .
+compute_config: lance-merge-cc:1
+# The custom pylance build is provided by the workspace env / image; if using the base
+# image, install the locally-built wheel here:
+# requirements:
+#   - /path/to/pylance-*.whl
+max_retries: 0
