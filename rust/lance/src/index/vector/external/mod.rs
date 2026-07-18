@@ -175,6 +175,16 @@ impl ExternalIvfPqIndex {
         search::search_batch(&self.inner, queries, k, nprobes, refine_factor, filter).await
     }
 
+    /// Exact brute-force search (no index) — scans every source-parquet vector and returns the
+    /// exact top-`k` per query. The no-index baseline for latency/recall comparison; O(|R|).
+    pub async fn search_flat(
+        &self,
+        queries: &[&[f32]],
+        k: usize,
+    ) -> Result<Vec<Vec<SearchResult>>> {
+        search::search_flat(&self.inner, queries, k).await
+    }
+
     /// Random-access fetch by `(file_path, row_index)` keys.
     ///
     /// Lance batches by file internally and issues one page-index-aware parquet

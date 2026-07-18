@@ -369,34 +369,66 @@ impl RerankReader {
             }
         }
 
-        let mut out: HashMap<u64, Vec<u8>> = HashMap::with_capacity(sorted.len());
+        // Build the list of (segment_index, global_run_start, global_run_end) ranges to read.
+        // IVF-PQ candidates are scattered, so most "runs" are a single ordinal. We (1) merge
+        // ordinals separated by a small gap into one range (reading a few unused rows is far
+        // cheaper than an extra object-store round trip), then (2) issue all range reads
+        // CONCURRENTLY. Previously these were awaited serially — at ~10 ms/RTT over abfss, 80
+        // scattered candidates cost ~0.8 s of pure latency per query; concurrency + gap-merge
+        // collapse that to a handful of parallel round trips.
+        const MAX_GAP_ROWS: u64 = 64; // merge runs within 64 rows; bounds wasted bytes per read.
+        struct Run {
+            seg_idx: usize,
+            start: u64, // global ordinal (inclusive)
+            end: u64,   // global ordinal (exclusive)
+        }
+        let mut runs: Vec<Run> = Vec::new();
         let mut i = 0usize;
         while i < sorted.len() {
             let run_start = sorted[i];
-            // The segment owning run_start (segments are sorted, tiling contiguously).
-            let seg = self
+            let seg_idx = self
                 .segments
                 .iter()
-                .find(|s| run_start >= s.base && run_start < s.base + s.count)
+                .position(|s| run_start >= s.base && run_start < s.base + s.count)
                 .ok_or_else(|| {
                     Error::index(format!("rerank fetch: ordinal {run_start} in no shard"))
                 })?;
-            let seg_end = seg.base + seg.count;
-            // Extend a run of consecutive ordinals that stay within this segment.
+            let seg_end = self.segments[seg_idx].base + self.segments[seg_idx].count;
+            // Extend the run while the next ordinal is within MAX_GAP_ROWS and same segment.
             let mut j = i + 1;
-            while j < sorted.len() && sorted[j] == sorted[j - 1] + 1 && sorted[j] < seg_end {
+            while j < sorted.len()
+                && sorted[j] < seg_end
+                && sorted[j] - sorted[j - 1] <= MAX_GAP_ROWS
+            {
                 j += 1;
             }
-            let run_end = sorted[j - 1] + 1; // exclusive, global
-            // Byte offsets are relative to the segment's start.
-            let byte_start = ((run_start - seg.base) * bpr) as usize;
-            let byte_end = ((run_end - seg.base) * bpr) as usize;
-            let bytes = seg.reader.get_range(byte_start..byte_end).await?;
+            runs.push(Run {
+                seg_idx,
+                start: run_start,
+                end: sorted[j - 1] + 1,
+            });
+            i = j;
+        }
+
+        // Issue every run's get_range concurrently, then stitch results.
+        let fetches = runs.iter().map(|run| {
+            let seg = &self.segments[run.seg_idx];
+            let byte_start = ((run.start - seg.base) * bpr) as usize;
+            let byte_end = ((run.end - seg.base) * bpr) as usize;
+            let reader = seg.reader.clone();
+            async move {
+                let bytes = reader.get_range(byte_start..byte_end).await?;
+                Ok::<(u64, u64, bytes::Bytes), Error>((run.start, run.end, bytes))
+            }
+        });
+        let results = futures::future::try_join_all(fetches).await?;
+
+        let mut out: HashMap<u64, Vec<u8>> = HashMap::with_capacity(sorted.len());
+        for (run_start, run_end, bytes) in results {
             for (k, ord) in (run_start..run_end).enumerate() {
                 let off = k * bpr_usize;
                 out.insert(ord, bytes[off..off + bpr_usize].to_vec());
             }
-            i = j;
         }
         Ok(out)
     }

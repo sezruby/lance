@@ -563,6 +563,52 @@ fn inner_search<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeSearchFlat<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    query: jni::objects::JFloatArray<'local>,
+    k: jint,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_search_flat(&mut env, handle, query, k))
+}
+
+fn inner_search_flat<'local>(
+    env: &mut JNIEnv<'local>,
+    handle: jlong,
+    query: jni::objects::JFloatArray<'local>,
+    k: jint,
+) -> Result<JObject<'local>> {
+    let idx = handle_to_idx(handle)?;
+    let q_len = env.get_array_length(&query)?;
+    let mut q_buf: Vec<jfloat> = vec![0.0; q_len as usize];
+    env.get_float_array_region(&query, 0, &mut q_buf)?;
+
+    let q_slice: &[f32] = &q_buf;
+    let batch: Vec<Vec<SearchResult>> = RT.block_on(async {
+        idx.search_flat(std::slice::from_ref(&q_slice), k as usize).await
+    })?;
+    let results = batch.into_iter().next().unwrap_or_default();
+
+    let result_class = env.find_class("org/lance/index/external/SearchResult")?;
+    let array = env.new_object_array(results.len() as i32, &result_class, JObject::null())?;
+    for (i, r) in results.iter().enumerate() {
+        let path = env.new_string(&r.file_path)?;
+        let obj = env.new_object(
+            &result_class,
+            "(Ljava/lang/String;JF)V",
+            &[
+                JValue::Object(&path),
+                JValue::Long(r.row_index as i64),
+                JValue::Float(r.distance),
+            ],
+        )?;
+        env.set_object_array_element(&array, i as i32, obj)?;
+    }
+    Ok(array.into())
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeSearchBatch<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,

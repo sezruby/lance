@@ -121,6 +121,19 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
   }
 
   /**
+   * Exact brute-force search: scans every source-parquet vector and returns the exact top-{@code
+   * k}. The no-index baseline — no IVF probe, no PQ, no refine — for latency/recall comparison.
+   * Cost is O(|R|): reads the full corpus once regardless of {@code k}. L2 / Cosine only.
+   *
+   * @param query Query vector. Length must match the index's dimension.
+   * @param k Number of results to return.
+   */
+  public List<SearchResult> searchFlat(float[] query, int k) {
+    SearchResult[] arr = nativeSearchFlat(handle, query, k);
+    return java.util.Arrays.asList(arr);
+  }
+
+  /**
    * Batched variant of {@link #search}. Runs {@code queries.length} queries in one JNI call,
    * sharing a single per-file refinement read across the whole batch. Designed for offline join
    * workloads where many query vectors are available up-front and would otherwise repeat the same
@@ -359,6 +372,8 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
 
   private static native SearchResult[] nativeSearch(
       long handle, float[] query, int k, int nprobes, int refineFactor, byte[] deletedRids);
+
+  private static native SearchResult[] nativeSearchFlat(long handle, float[] query, int k);
 
   private static native SearchResult[][] nativeSearchBatch(
       long handle, float[][] queries, int k, int nprobes, int refineFactor, byte[] deletedRids);

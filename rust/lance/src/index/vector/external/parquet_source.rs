@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use arrow::compute::concat;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch, UInt64Array,
+    new_empty_array, Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
@@ -26,7 +27,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use object_store::ObjectStoreExt;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
 use parquet::arrow::async_reader::{
     AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -109,28 +110,39 @@ impl ParquetVectorSource {
         Ok(total)
     }
 
-    /// Sample up to `n` vectors uniformly across the file list for training.
+    /// Sample up to `n` vectors for kmeans + PQ training, spread across each file's FULL row
+    /// range rather than its first rows (strided by default, or random via
+    /// `LANCE_EXT_SAMPLE_STRATEGY=random`).
     ///
-    /// Strategy: round-robin read from each file's start until `n` is hit. For PQ
-    /// training this is sufficient — kmeans + codebook quality is set by vector
-    /// distribution, not by random row selection. A future iteration can add
-    /// reservoir sampling if recall numbers say it's needed.
+    /// Why spread across the range, not first-N: source parquet is frequently value-ordered
+    /// (e.g. Wikipedia embeddings are laid out article-by-article, so consecutive rows are
+    /// paragraphs of the same document). A first-N-per-file sample is then a highly correlated,
+    /// low-diversity slice — it trains centroids + codebook on a skewed sub-distribution and
+    /// measurably drops recall. The read stays cheap because `RowSelection` uses the parquet
+    /// page/offset index to skip unselected rows (the same mechanism as the refinement fetch),
+    /// so we page-decode only the rows we keep.
+    ///
+    /// Reproducible: the per-file phase / RNG seed is derived from the file's position, so the
+    /// sample — and thus the trained index — is stable across runs.
     pub async fn sample(&self, n: usize) -> Result<FixedSizeListArray> {
         let per_file = n.div_ceil(self.files.len()).max(1);
         let mut accumulated: Vec<ArrayRef> = Vec::new();
         let mut total = 0usize;
 
-        for spec in &self.files {
+        for (file_idx, spec) in self.files.iter().enumerate() {
             if total >= n {
                 break;
             }
             let want = (n - total).min(per_file);
-            let fsl = read_first_n_vectors(&spec.file_path, &self.vector_column, want).await?;
+            let fsl = read_range_spread_vectors(
+                &spec.file_path,
+                &self.vector_column,
+                want,
+                file_idx as u64,
+            )
+            .await?;
             total += fsl.len();
             accumulated.push(Arc::new(fsl));
-            if total >= n {
-                break;
-            }
         }
 
         let array_refs: Vec<&dyn Array> = accumulated.iter().map(|a| a.as_ref()).collect();
@@ -604,36 +616,91 @@ pub(crate) fn coerce_to_fsl(col: &ArrayRef, expected_dim: usize) -> Result<Fixed
     )))
 }
 
-async fn read_first_n_vectors(path: &str, column: &str, n: usize) -> Result<FixedSizeListArray> {
+/// Read up to `n` vectors from `path`, spread across the file's FULL row range (not the
+/// first `n`). Strategy is chosen by env `LANCE_EXT_SAMPLE_STRATEGY` ("strided" default, or
+/// "random"); `seed_salt` (the file's position) staggers per-file offsets so files don't all
+/// sample the same relative positions, and keeps the sample reproducible.
+///
+/// Spreading across the range (vs first-N) matters on value-ordered corpora (e.g. Wikipedia
+/// embeddings laid out article-by-article): a first-N slice is a correlated, low-diversity
+/// training set that drops recall. Either strategy uses a `RowSelection` so the parquet reader
+/// skips unselected rows via the page/offset index (loaded with `PageIndexPolicy::Required`) —
+/// it page-decodes only the kept rows, not the whole file. See [`ParquetVectorSource::sample`].
+async fn read_range_spread_vectors(
+    path: &str,
+    column: &str,
+    n: usize,
+    seed_salt: u64,
+) -> Result<FixedSizeListArray> {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
     let dim = read_vector_dim(path, column).await?;
-    let builder = open_parquet_async(path).await?;
+    // Page index required so RowSelection can skip cheaply.
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+    let builder = open_parquet_async_with_options(path, options).await?;
+    let total_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
     let mask = ProjectionMask::columns(builder.parquet_schema(), [column]);
+
+    if total_rows == 0 || n == 0 {
+        let empty = new_empty_array(&DataType::Float32);
+        let f32 = empty.as_any().downcast_ref::<Float32Array>().unwrap().clone();
+        return FixedSizeListArray::try_new_from_values(f32, dim as i32)
+            .map_err(|e| Error::invalid_input(format!("empty FSL construction failed: {e}")));
+    }
+
+    // Pick `want` row indices across the FULL range. Two strategies (env
+    // `LANCE_EXT_SAMPLE_STRATEGY`, default "strided"):
+    //   - "strided": evenly-spaced offsets (phase-shifted per file). Guarantees uniform coverage
+    //     of a value-ordered range; measured best on article-ordered Cohere data.
+    //   - "random": distinct uniform-random offsets (mirrors Lance-core's sample_fsl_uniform).
+    // Both read via the page-index RowSelection below, so cost is identical; only which rows are
+    // trained on differs. Kept as a toggle so the two can be A/B'd against recall directly.
+    let want = n.min(total_rows);
+    let strategy = std::env::var("LANCE_EXT_SAMPLE_STRATEGY").unwrap_or_else(|_| "strided".into());
+    let indices: Vec<usize> = if want == total_rows {
+        (0..total_rows).collect()
+    } else if strategy.eq_ignore_ascii_case("random") {
+        let mut rng = StdRng::seed_from_u64(0xA5A5_5A5A_C0FF_EE00 ^ seed_salt);
+        let mut chosen = std::collections::HashSet::with_capacity(want);
+        while chosen.len() < want {
+            chosen.insert(rng.gen_range(0..total_rows));
+        }
+        let mut v: Vec<usize> = chosen.into_iter().collect();
+        // RowSelection requires strictly increasing ranges.
+        v.sort_unstable();
+        v
+    } else {
+        // Strided: evenly-spaced, offset by a per-file phase so files stagger their samples.
+        let stride = (total_rows / want).max(1);
+        let start = (seed_salt as usize).wrapping_mul(2_654_435_761) % stride;
+        let mut v: Vec<usize> = Vec::with_capacity(want);
+        let mut r = start;
+        while r < total_rows && v.len() < want {
+            v.push(r);
+            r += stride;
+        }
+        v
+    };
+    let ranges: Vec<std::ops::Range<usize>> = indices.iter().map(|&i| i..(i + 1)).collect();
+    let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows);
+
     let mut stream = builder
         .with_projection(mask)
-        .with_batch_size(n.max(1024))
+        .with_row_selection(selection)
         .build()
         .map_err(|e| parquet_reader_err(path, e))?;
 
-    let mut collected = 0usize;
     let mut fsl_chunks: Vec<FixedSizeListArray> = Vec::new();
     while let Some(batch) = stream
         .try_next()
         .await
         .map_err(|e| parquet_batch_err(path, e))?
     {
-        let take_n = (n - collected).min(batch.num_rows());
-        let col = batch
-            .column_by_name(column)
-            .ok_or_else(|| {
-                Error::invalid_input(format!("column '{column}' missing from batch in {path}"))
-            })?
-            .slice(0, take_n);
-        let fsl = coerce_to_fsl(&col, dim)?;
-        fsl_chunks.push(fsl);
-        collected += take_n;
-        if collected >= n {
-            break;
-        }
+        let col = batch.column_by_name(column).ok_or_else(|| {
+            Error::invalid_input(format!("column '{column}' missing from batch in {path}"))
+        })?;
+        fsl_chunks.push(coerce_to_fsl(col, dim)?);
     }
 
     let array_refs: Vec<&dyn Array> = fsl_chunks.iter().map(|a| a as &dyn Array).collect();
@@ -780,6 +847,47 @@ mod tests {
         let sample = src.sample(60).await.unwrap();
         assert_eq!(sample.len(), 60);
         assert_eq!(sample.value_length(), 4);
+    }
+
+    // The training sample must spread across each file's FULL row range and pick DISTINCT
+    // rows, not just its first rows — a first-N sample is a correlated, low-diversity slice
+    // on value-ordered corpora and drops recall (see `ParquetVectorSource::sample`). One
+    // 1000-row file with row r's first value = r*dim; a range-spread sample of 100 rows
+    // must reach rows well past the first 100 (which a first-N sample cannot) and be
+    // duplicate-free.
+    #[tokio::test]
+    async fn sample_spreads_across_full_row_range() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("part-0.parquet");
+        let (num_rows, dim) = (1000usize, 4usize);
+        make_parquet(&p, num_rows, dim, 0.0); // row r → first value r*dim
+        let src = ParquetVectorSource::try_new(vec![ParquetFileSpec::of(p.to_str().unwrap())], "vec")
+            .await
+            .unwrap();
+        let want = 100usize;
+        let sample = src.sample(want).await.unwrap();
+        assert_eq!(sample.len(), want);
+        // Recover each sampled row index from its first value (= row * dim).
+        let values = sample
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let mut sampled_rows: Vec<usize> = (0..sample.len())
+            .map(|i| (values.value(i * dim) as usize) / dim)
+            .collect();
+        sampled_rows.sort_unstable();
+        let max_row = *sampled_rows.last().unwrap();
+        // A first-N sample would top out at row `want-1` (=99). A range-spread sample over
+        // 1000 rows must reach far beyond that (near ~990).
+        assert!(
+            max_row > want * 5,
+            "sample did not spread across the file: max sampled row {max_row} \
+             (want={want}); a range-spread sample should reach near {num_rows}"
+        );
+        // Sampled rows must be distinct (the sampler dedups before building the selection).
+        let distinct = sampled_rows.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(distinct, want, "sampled rows must be distinct");
     }
 
     #[tokio::test]

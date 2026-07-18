@@ -191,9 +191,25 @@ pub(super) async fn train_quantizers(
     let centroids =
         FixedSizeListArray::try_new_from_values(kmeans.centroids.clone(), kmeans.dimension as i32)
             .map_err(|e| Error::index(format!("kmeans centroids → FixedSizeListArray: {e}")))?;
-    let ivf = IvfModel::new(centroids, None);
+    let ivf = IvfModel::new(centroids.clone(), None);
+
+    // Train the PQ codebook on RESIDUALS (vector − assigned centroid), not raw vectors,
+    // for L2/Cosine. This mirrors Lance-core's IVF-PQ build (`build_pq_model` computes the
+    // residual of the training sample before `PQBuildParams::build`). It is required for
+    // correctness, not just quality: the encode path (`IvfTransformer::with_pq`) auto-inserts
+    // a ResidualTransform for these metrics, so PQ codes are applied in residual space —
+    // training the codebook on raw vectors would mismatch train vs encode distributions and
+    // materially drops recall. Dot product does not use residuals (matches `use_residual`).
+    let use_residual = matches!(params.metric, MetricType::L2 | MetricType::Cosine);
+    let pq_training = if use_residual {
+        let ivf_transformer =
+            lance_index::vector::ivf::new_ivf_transformer(centroids, MetricType::L2, vec![]);
+        ivf_transformer.compute_residual(&training)?
+    } else {
+        training.clone()
+    };
     let pq = PQBuildParams::new(params.num_sub_vectors, params.num_bits_per_sub_vector)
-        .build(&training, params.metric.into())
+        .build(&pq_training, params.metric)
         .map_err(|e| Error::index(format!("PQ training failed: {e}")))?;
     Ok((ivf, pq, training))
 }
