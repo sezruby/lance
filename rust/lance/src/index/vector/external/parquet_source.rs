@@ -583,7 +583,25 @@ pub(crate) fn coerce_to_fsl(col: &ArrayRef, expected_dim: usize) -> Result<Fixed
                 expected_dim
             )));
         }
-        return Ok(fsl.clone());
+        // Rebuild rather than clone: different parquet writers name the FSL child field
+        // variously ("item", "element", "l") with differing nullability, but the build
+        // pipeline's out_schema uses a canonical child field. Returning the input FSL
+        // verbatim makes RecordBatch::try_new fail its strict field-equality check
+        // (e.g. "expected FixedSizeList(32 x Float32) but found FixedSizeList(32 x Float32,
+        // field: 'element')"). Reconstructing from the raw f32 values normalizes it.
+        let f32_values = fsl
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "FixedSizeList vector column has non-Float32 inner type {:?}",
+                    fsl.values().data_type()
+                ))
+            })?
+            .clone();
+        return FixedSizeListArray::try_new_from_values(f32_values, expected_dim as i32)
+            .map_err(|e| Error::invalid_input(format!("FSL normalization failed: {e}")));
     }
     if let Some(la) = col.as_any().downcast_ref::<ListArray>() {
         let values = la.values();

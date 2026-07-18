@@ -66,6 +66,7 @@ pub(crate) mod dataset;
 pub(crate) mod debug;
 pub(crate) mod error;
 pub(crate) mod executor;
+pub(crate) mod external_index;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
@@ -246,6 +247,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_logging(log_builder);
 
     m.add_class::<FFILanceTableProvider>()?;
+    m.add_class::<external_index::PyExternalIvfPqIndex>()?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
