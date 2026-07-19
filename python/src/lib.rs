@@ -248,6 +248,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<FFILanceTableProvider>()?;
     m.add_class::<external_index::PyExternalIvfPqIndex>()?;
+    m.add_function(wrap_pyfunction!(external_index::external_train_broadcast, m)?)?;
+    m.add_function(wrap_pyfunction!(external_index::external_build_shard, m)?)?;
+    m.add_function(wrap_pyfunction!(external_index::external_merge_shards, m)?)?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;

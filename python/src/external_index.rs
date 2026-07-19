@@ -13,12 +13,14 @@ use std::sync::Arc;
 
 use arrow::pyarrow::ToPyArrow;
 use lance::index::vector::external::{
+    build_shard_to_parquet, merge_shards_to_index, train_broadcast_payload, BroadcastPayload,
     ExternalIvfPqIndex, ExternalIvfPqIndexParams, ParquetFileSpec, ParquetRowKey, RerankStore,
     SearchResult,
 };
 use lance_linalg::distance::MetricType;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use crate::error::PythonErrorExt;
 use crate::rt;
@@ -242,4 +244,133 @@ impl PyExternalIvfPqIndex {
             .infer_error()?;
         batch.to_pyarrow(py)
     }
+}
+
+// ---- Distributed build (Ray / any orchestrator) --------------------------------------------
+//
+// Three module functions mirroring the JNI distributed surface. The orchestrator (e.g. a Ray
+// driver) does: train_broadcast on the head → ship the returned bytes to workers → each worker
+// build_shard over its file range → driver merge_shards. Only the ~KB payload + sidecar row
+// counts cross between nodes; each worker reads/encodes its own file shard, so peak memory is
+// per-shard, not whole-corpus (this is the fix for large-|R| builds that OOM single-node).
+
+/// Driver phase 1: train IVF centroids + PQ codebook on a sample of the whole corpus, returning
+/// a broadcast-ready byte payload (quantizers + SQ8 bounds). Cheap — reads a sample, not |R|.
+#[pyfunction]
+#[pyo3(signature = (
+    file_paths, vector_column,
+    num_partitions = 256, num_sub_vectors = 16, num_bits_per_sub_vector = 8,
+    metric = "l2", max_iters = 50, sample_rate = 256, seed = 0, rerank_store = "none"
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn external_train_broadcast<'py>(
+    py: Python<'py>,
+    file_paths: Vec<String>,
+    vector_column: String,
+    num_partitions: usize,
+    num_sub_vectors: usize,
+    num_bits_per_sub_vector: usize,
+    metric: &str,
+    max_iters: usize,
+    sample_rate: usize,
+    seed: u64,
+    rerank_store: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let params = build_params(
+        num_partitions, num_sub_vectors, num_bits_per_sub_vector,
+        metric, max_iters, sample_rate, seed, rerank_store,
+    )?;
+    let files: Vec<ParquetFileSpec> = file_paths.into_iter().map(ParquetFileSpec::of).collect();
+    let bytes = rt()
+        .block_on(None, async move {
+            train_broadcast_payload(files, &vector_column, &params).await
+        })?
+        .infer_error()?
+        .to_bytes();
+    Ok(PyBytes::new(py, &bytes))
+}
+
+/// Executor phase 2: encode this worker's file shard into an index shard parquet at
+/// `shard_uri` (+ a rerank sidecar shard when a store is set), using the broadcast payload.
+/// `file_id_offset` = the global index of this shard's first file so rids stay consistent.
+/// Returns the sidecar shard's row count (0 when no rerank store).
+#[pyfunction]
+#[pyo3(signature = (
+    payload, file_paths, vector_column, file_id_offset, shard_uri,
+    num_partitions = 256, num_sub_vectors = 16, num_bits_per_sub_vector = 8,
+    metric = "l2", max_iters = 50, sample_rate = 256, seed = 0, rerank_store = "none"
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn external_build_shard(
+    payload: Vec<u8>,
+    file_paths: Vec<String>,
+    vector_column: String,
+    file_id_offset: u32,
+    shard_uri: String,
+    num_partitions: usize,
+    num_sub_vectors: usize,
+    num_bits_per_sub_vector: usize,
+    metric: &str,
+    max_iters: usize,
+    sample_rate: usize,
+    seed: u64,
+    rerank_store: &str,
+) -> PyResult<u64> {
+    let params = build_params(
+        num_partitions, num_sub_vectors, num_bits_per_sub_vector,
+        metric, max_iters, sample_rate, seed, rerank_store,
+    )?;
+    let files: Vec<ParquetFileSpec> = file_paths.into_iter().map(ParquetFileSpec::of).collect();
+    let res = rt()
+        .block_on(None, async move {
+            let bp = BroadcastPayload::from_bytes(&payload)?;
+            build_shard_to_parquet(&bp, files, &vector_column, file_id_offset, &params, &shard_uri)
+                .await
+        })?
+        .infer_error()?;
+    Ok(res.sidecar.map(|s| s.rows).unwrap_or(0))
+}
+
+/// Driver phase 3: heap-merge the shard parquets into `<index_dir_uri>/<uuid>/index.idx` +
+/// manifest, leaving an openable index directory. `file_paths` is the full sorted file list
+/// (position = global file_id). `sidecar_shards` are `(uri, rows)` in global file order (empty
+/// when no rerank store). Only PQ codes cross back — cheap relative to the encode. Returns the
+/// resulting index directory URI.
+#[pyfunction]
+#[pyo3(signature = (
+    payload, shard_uris, file_paths, vector_column, index_dir_uri, sidecar_shards,
+    num_partitions = 256, num_sub_vectors = 16, num_bits_per_sub_vector = 8,
+    metric = "l2", max_iters = 50, sample_rate = 256, seed = 0, rerank_store = "none"
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn external_merge_shards(
+    payload: Vec<u8>,
+    shard_uris: Vec<String>,
+    file_paths: Vec<String>,
+    vector_column: String,
+    index_dir_uri: String,
+    sidecar_shards: Vec<(String, u64)>,
+    num_partitions: usize,
+    num_sub_vectors: usize,
+    num_bits_per_sub_vector: usize,
+    metric: &str,
+    max_iters: usize,
+    sample_rate: usize,
+    seed: u64,
+    rerank_store: &str,
+) -> PyResult<()> {
+    let params = build_params(
+        num_partitions, num_sub_vectors, num_bits_per_sub_vector,
+        metric, max_iters, sample_rate, seed, rerank_store,
+    )?;
+    rt()
+        .block_on(None, async move {
+            let bp = BroadcastPayload::from_bytes(&payload)?;
+            merge_shards_to_index(
+                &bp, &shard_uris, &file_paths, &vector_column, &index_dir_uri, &params,
+                &sidecar_shards,
+            )
+            .await
+        })?
+        .infer_error()
 }
