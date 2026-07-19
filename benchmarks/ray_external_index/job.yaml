@@ -1,0 +1,19 @@
+name: lance-knn-serving
+entrypoint: bash entrypoint.sh
+working_dir: .
+compute_config: <YOUR_COMPUTE_CONFIG>
+max_retries: 0
+env_vars:
+  RAY_KNN_PARQUET_DIR: "abfss://CONTAINER@ACCOUNT.dfs.core.windows.net/PREFIX/corpus_parquet"
+  RAY_KNN_INDEX_URI: "abfss://CONTAINER@ACCOUNT.dfs.core.windows.net/PREFIX/knn-index"
+  RAY_KNN_VEC_COL: "emb"
+  RAY_KNN_ACTORS: "8"
+  RAY_KNN_QUERIES: "2000"
+  RAY_KNN_K: "10"
+  RAY_KNN_NPROBES: "16"
+  RAY_KNN_REFINE: "8"
+  RAY_KNN_STORE: "sq8"
+  RAY_KNN_REUSE: "true"
+  RAY_KNN_MAX_FILES: "20"
+  AZURE_STORAGE_ACCOUNT_NAME: "<ACCOUNT>"
+  AZURE_STORAGE_ACCOUNT_KEY: "<SET_VIA_ENV>"
