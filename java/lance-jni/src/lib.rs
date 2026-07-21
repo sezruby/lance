@@ -56,6 +56,7 @@ mod mem_wal;
 mod merge_insert;
 mod namespace;
 mod optimize;
+mod scalar_external_index;
 mod schema;
 mod session;
 mod sql;

@@ -40,7 +40,10 @@ use crate::RT;
 /// RowFilter implementation that holds a sorted list of deleted rids. Caller
 /// passes the rids as a packed `(file_id << 32) | row_index` u64 array. We
 /// resolve the file_id via the index manifest at search time.
-struct DeletedRidFilter {
+///
+/// `pub(crate)` so the scalar external index JNI ([`crate::scalar_external_index`])
+/// reuses the exact same deleted-rids filter rather than duplicating it.
+pub(crate) struct DeletedRidFilter {
     /// Sorted, deduped deleted rids. Binary search per refinement candidate.
     deleted: Vec<u64>,
     /// Path → file_id index for fast lookup.
@@ -61,7 +64,9 @@ impl RowFilter for DeletedRidFilter {
 
 /// Build a non-empty filter from a Java `byte[]` of u64-LE deleted rids.
 /// Returns `Ok(None)` when the byte array is null or empty.
-fn build_filter_from_bytes(
+///
+/// `pub(crate)` so the scalar external index JNI shares this exact decode.
+pub(crate) fn build_filter_from_bytes(
     env: &mut JNIEnv,
     deleted_bytes: &JByteArray,
     file_id_by_path: std::collections::HashMap<String, u32>,
@@ -766,13 +771,25 @@ fn inner_fetch_rows<'local>(
     // Run fetch
     let batch = RT.block_on(async { idx.fetch_rows(&row_keys, &proj_refs).await })?;
 
-    // Serialize to Arrow IPC stream bytes.
+    // Serialize to Arrow IPC stream bytes (shared with the scalar external index).
+    record_batch_to_ipc_jbytes(env, &batch)
+}
+
+/// Serialize a `RecordBatch` to Arrow IPC stream bytes and return it as a Java
+/// `byte[]`. Shared by both external indexes' `nativeFetchRows` so the Java
+/// caller can decode with `ArrowStreamReader` without a `RecordBatch` bridge.
+///
+/// `pub(crate)` so [`crate::scalar_external_index`] reuses the exact serialization.
+pub(crate) fn record_batch_to_ipc_jbytes(
+    env: &mut JNIEnv,
+    batch: &arrow_array::RecordBatch,
+) -> Result<jbyteArray> {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     {
         let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
             .map_err(|e| Error::io_error(format!("ipc writer init: {e}")))?;
         writer
-            .write(&batch)
+            .write(batch)
             .map_err(|e| Error::io_error(format!("ipc write: {e}")))?;
         writer
             .finish()

@@ -242,7 +242,7 @@ const REFINEMENT_PARALLEL_RANGES: usize = 32;
 /// latency on cloud storage where per-request RTT dominates.
 ///
 /// All other `AsyncFileReader` methods delegate to the inner reader unchanged.
-pub(super) struct CoalescingParquetReader {
+pub(crate) struct CoalescingParquetReader {
     inner: ParquetObjectReader,
     /// Reference to the same object_store the inner reader uses, so our
     /// custom `get_byte_ranges` can issue the coalesced fetch directly.
@@ -384,7 +384,7 @@ fn slice_merged(
 /// The cache lives on [`super::OpenedExternalIndex`] so its lifetime matches
 /// one task's worth of queries; per-task is enough to amortize the overhead
 /// across all queries running on the task.
-pub(super) struct ParquetMetaCache {
+pub(crate) struct ParquetMetaCache {
     inner: Mutex<HashMap<String, CachedFile>>,
 }
 
@@ -399,7 +399,7 @@ struct CachedFile {
 }
 
 impl ParquetMetaCache {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
         }
@@ -420,7 +420,7 @@ impl std::fmt::Debug for ParquetMetaCache {
 /// Returns the [`ParquetRecordBatchStreamBuilder`] which the caller turns into
 /// a stream via `.with_projection(...).build()`. The async reader supports the
 /// same options as the sync one (page index, row selection, projection mask).
-pub(super) async fn open_parquet_async(
+pub(crate) async fn open_parquet_async(
     path: &str,
 ) -> Result<ParquetRecordBatchStreamBuilder<CoalescingParquetReader>> {
     open_parquet_async_with_options(path, ArrowReaderOptions::new()).await

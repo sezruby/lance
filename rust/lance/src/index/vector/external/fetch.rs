@@ -43,6 +43,34 @@ pub async fn fetch_rows(
     row_keys: &[ParquetRowKey],
     projection: &[&str],
 ) -> Result<RecordBatch> {
+    let first_file_path = opened
+        .manifest
+        .files
+        .first()
+        .map(|f| f.file_path.as_str())
+        .unwrap_or("");
+    fetch_rows_impl(
+        &opened.parquet_meta_cache,
+        |p| opened.manifest.file_id(p).is_some(),
+        first_file_path,
+        row_keys,
+        projection,
+    )
+    .await
+}
+
+/// Storage-agnostic core of [`fetch_rows`]. Reused by the external scalar (BTree)
+/// index, which carries the same `(file_path, row_index)` identity model but its
+/// own manifest type. `is_registered` validates that a fetched path belongs to the
+/// index's registered file set; `first_file_path` supplies the schema source for
+/// the empty-input case.
+pub(crate) async fn fetch_rows_impl(
+    parquet_meta_cache: &ParquetMetaCache,
+    is_registered: impl Fn(&str) -> bool,
+    first_file_path: &str,
+    row_keys: &[ParquetRowKey],
+    projection: &[&str],
+) -> Result<RecordBatch> {
     if projection.is_empty() {
         return Err(Error::invalid_input(
             "fetch_rows: projection must contain at least one column",
@@ -64,7 +92,7 @@ pub async fn fetch_rows(
     // catches typos early and matches the contract that fetched files belong
     // to the registered set.
     for path in by_file.keys() {
-        if opened.manifest.file_id(path).is_none() {
+        if !is_registered(path) {
             return Err(Error::invalid_input(format!(
                 "fetch_rows: file '{path}' not registered with this index"
             )));
@@ -74,8 +102,7 @@ pub async fn fetch_rows(
     // Pull the schema from the first file's read so we can build an empty batch
     // of the projected schema if the input is empty.
     if row_keys.is_empty() {
-        let any_path = &opened.manifest.files[0].file_path;
-        let schema = projected_schema_from_file(any_path, projection).await?;
+        let schema = projected_schema_from_file(first_file_path, projection).await?;
         return Ok(RecordBatch::new_empty(schema));
     }
 
@@ -86,7 +113,7 @@ pub async fn fetch_rows(
     for (file_path, hits) in by_file {
         let row_indices: Vec<u64> = hits.iter().map(|(_, r)| *r).collect();
         let batch = read_rows_from_file(
-            &opened.parquet_meta_cache,
+            parquet_meta_cache,
             &file_path,
             projection,
             &row_indices,

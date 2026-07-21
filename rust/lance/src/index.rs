@@ -76,6 +76,7 @@ pub mod frag_reuse;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
+pub mod scalar_external;
 pub(crate) mod scalar_logical;
 pub mod vector;
 

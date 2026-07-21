@@ -33,7 +33,7 @@
 
 mod build;
 pub(crate) mod distributed;
-mod fetch;
+pub(crate) mod fetch;
 pub(crate) mod manifest;
 pub(crate) mod open;
 pub mod params;
