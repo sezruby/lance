@@ -25,17 +25,23 @@ use std::sync::Arc;
 
 use arrow::ipc::writer::StreamWriter;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString, JValue};
-use jni::sys::{jbyteArray, jfloat, jint, jlong, jlongArray};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue};
+use jni::sys::{jbyteArray, jdouble, jfloat, jint, jlong, jlongArray};
 use lance::index::vector::external::{
     ExternalIvfPqIndex, ExternalIvfPqIndexParams, ParquetFileSpec, ParquetRowKey, RerankStore,
-    RowFilter, SearchResult,
+    RowFilter, SearchResult, assemble_payload_resident, compute_partial_stats_resident,
+    free_resident_samples, load_driver_sample, sample_shard_to_parquet,
+    select_initial_centroids_resident,
 };
+use lance_index::vector::kmeans::distributed::PartialStats;
 use lance_linalg::distance::MetricType;
 
-use crate::error::{Error, Result};
-use crate::traits::FromJString;
 use crate::RT;
+use crate::distributed_kmeans::{
+    fsl_to_centroids_ipc, ipc_to_centroids_fsl, ipc_to_record_batch, record_batch_to_ipc,
+};
+use crate::error::{Error, Result};
+use crate::traits::{FromJObjectWithEnv, FromJString};
 
 /// RowFilter implementation that holds a sorted list of deleted rids. Caller
 /// passes the rids as a packed `(file_id << 32) | row_index` u64 array. We
@@ -108,7 +114,7 @@ fn parse_rerank_store(s: &str) -> Result<RerankStore> {
     }
 }
 
-fn parse_metric(s: &str) -> Result<MetricType> {
+pub(crate) fn parse_metric(s: &str) -> Result<MetricType> {
     match s.to_ascii_lowercase().as_str() {
         "l2" => Ok(MetricType::L2),
         "cosine" => Ok(MetricType::Cosine),
@@ -207,7 +213,7 @@ fn inner_build<'local>(
 /// Build `ExternalIvfPqIndexParams` from the flat JNI scalar args (shared by the
 /// single-box and distributed build entry points).
 #[allow(clippy::too_many_arguments)]
-fn params_from_args(
+pub(crate) fn params_from_args(
     env: &mut JNIEnv,
     num_partitions: jint,
     num_sub_vectors: jint,
@@ -232,7 +238,7 @@ fn params_from_args(
         .build())
 }
 
-fn extract_string_array(env: &mut JNIEnv, arr: &JObjectArray) -> Result<Vec<String>> {
+pub(crate) fn extract_string_array(env: &mut JNIEnv, arr: &JObjectArray) -> Result<Vec<String>> {
     let n = env.get_array_length(arr)?;
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -366,7 +372,9 @@ pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeBu
 /// the full sorted file list (position = global file_id, matching the shard rids).
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeMergeShards<'local>(
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeMergeShards<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     payload_bytes: JByteArray<'local>,
@@ -442,6 +450,303 @@ fn payload_from_jbytes(
 ) -> Result<lance::index::vector::external::BroadcastPayload> {
     let raw = env.convert_byte_array(bytes)?;
     Ok(lance::index::vector::external::BroadcastPayload::from_bytes(&raw)?)
+}
+
+/// Executor (distributed READ): draw `sample_size` training rows from this shard's
+/// parquet `file_paths` and write them to `out_uri` as a compact single-column parquet;
+/// returns the number of rows written. Run per shard so the ~1000-file random-access
+/// sample scan is parallelized across the cluster. The sample stays off the JVM heap:
+/// the driver trains over the union of these compact files via `nativeTrainBroadcast`,
+/// off-heap and native — no multi-GiB `collect()` onto the driver heap.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeSampleShardToParquet<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    file_paths: JObjectArray<'local>,
+    vector_column: JString<'local>,
+    sample_size: jint,
+    out_uri: JString<'local>,
+) -> jlong {
+    let result = (|| -> Result<u64> {
+        if sample_size < 0 {
+            return Err(Error::input_error(format!(
+                "sample_size must be >= 0, got {sample_size}"
+            )));
+        }
+        let paths = extract_string_array(&mut env, &file_paths)?;
+        let files: Vec<ParquetFileSpec> = paths.into_iter().map(ParquetFileSpec::of).collect();
+        let vector_column_str: String = vector_column.extract(&mut env)?;
+        let out_uri_str: String = out_uri.extract(&mut env)?;
+        let rows = RT.block_on(async move {
+            sample_shard_to_parquet(
+                files,
+                &vector_column_str,
+                sample_size as usize,
+                &out_uri_str,
+            )
+            .await
+        })?;
+        Ok(rows)
+    })();
+    match result {
+        Ok(rows) => rows as jlong,
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            0
+        }
+    }
+}
+
+/// Convergence probe: the total assignment loss carried by a reduced `PartialStats`
+/// batch (`stats_ipc`). The orchestration stops the Lloyd loop when the relative loss
+/// delta between iterations falls under its tolerance. Returns `-1.0` and throws on
+/// error.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeTotalLoss<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    stats_ipc: JByteArray<'local>,
+) -> jdouble {
+    let result = (|| -> Result<f64> {
+        let stats = PartialStats::from_record_batch(ipc_to_record_batch(&mut env, &stats_ipc)?)?;
+        Ok(stats.total_loss())
+    })();
+    match result {
+        Ok(loss) => loss as jdouble,
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            -1.0
+        }
+    }
+}
+
+// ---- off-JVM resident-sample training (Ray-portable) ------------------------
+//
+// The orchestrator (Spark today, Ray later) passes only ids + file paths + centroid
+// bytes; the sample vectors are read once into a native registry and never re-cross
+// this boundary. See `distributed::compute_partial_stats_resident` and friends.
+
+/// Executor E-step over the *resident* shard sample: load-on-miss from `shard_files`
+/// keyed by `(session_id, shard_id)`, then assign to `centroids_ipc`. Returns the
+/// per-cluster `PartialStats` IPC; the sample stays native across Lloyd iterations, so
+/// only ids, file paths and centroid bytes cross this boundary.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeComputePartialStatsResident<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: jlong,
+    shard_id: jint,
+    shard_files: JObjectArray<'local>,
+    vector_column: JString<'local>,
+    sample_size: jint,
+    centroids_ipc: JByteArray<'local>,
+    metric: JString<'local>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>> {
+        if sample_size < 0 {
+            return Err(Error::input_error(format!(
+                "sample_size must be >= 0, got {sample_size}"
+            )));
+        }
+        let paths = extract_string_array(&mut env, &shard_files)?;
+        let files: Vec<ParquetFileSpec> = paths.into_iter().map(ParquetFileSpec::of).collect();
+        let vector_column_str: String = vector_column.extract(&mut env)?;
+        let centroids = ipc_to_centroids_fsl(&mut env, &centroids_ipc)?;
+        let metric_str: String = metric.extract(&mut env)?;
+        let dt = parse_metric(&metric_str)?;
+        let batch = RT.block_on(async move {
+            compute_partial_stats_resident(
+                session_id,
+                shard_id,
+                files,
+                &vector_column_str,
+                sample_size as usize,
+                &centroids,
+                dt,
+            )
+            .await
+        })?;
+        record_batch_to_ipc(&batch)
+    })();
+    match result {
+        Ok(bytes) => env
+            .byte_array_from_slice(&bytes)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Driver: read every shard's training sample once into one resident FSL keyed
+/// `(session_id, DRIVER_SHARD_ID)` and return its row count. `flat_files` is every
+/// shard's files concatenated; `group_sizes[i]` is shard `i`'s file count. No sample
+/// bytes cross into JVM heap. Returns `-1` and throws on error.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeLoadDriverSample<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: jlong,
+    flat_files: JObjectArray<'local>,
+    group_sizes: JIntArray<'local>,
+    vector_column: JString<'local>,
+    per_shard_sample: jint,
+) -> jlong {
+    let result = (|| -> Result<usize> {
+        if per_shard_sample < 0 {
+            return Err(Error::input_error(format!(
+                "per_shard_sample must be >= 0, got {per_shard_sample}"
+            )));
+        }
+        let flat = extract_string_array(&mut env, &flat_files)?;
+        let sizes: Vec<i32> = group_sizes.extract_object(&mut env)?;
+        let mut groups: Vec<Vec<ParquetFileSpec>> = Vec::with_capacity(sizes.len());
+        let mut idx = 0usize;
+        for sz in sizes {
+            if sz < 0 {
+                return Err(Error::input_error(format!(
+                    "group size must be >= 0, got {sz}"
+                )));
+            }
+            let sz = sz as usize;
+            if idx + sz > flat.len() {
+                return Err(Error::input_error(
+                    "group sizes exceed flat file count".to_string(),
+                ));
+            }
+            let group = flat[idx..idx + sz]
+                .iter()
+                .cloned()
+                .map(ParquetFileSpec::of)
+                .collect();
+            groups.push(group);
+            idx += sz;
+        }
+        if idx != flat.len() {
+            return Err(Error::input_error(
+                "group sizes do not cover all files".to_string(),
+            ));
+        }
+        let vector_column_str: String = vector_column.extract(&mut env)?;
+        let n = RT.block_on(async move {
+            load_driver_sample(
+                session_id,
+                groups,
+                &vector_column_str,
+                per_shard_sample as usize,
+            )
+            .await
+        })?;
+        Ok(n)
+    })();
+    match result {
+        Ok(n) => n as jlong,
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            -1
+        }
+    }
+}
+
+/// Driver init: pick `k` initial centroids from the resident driver sample (loaded by
+/// `nativeLoadDriverSample`). Returns centroids IPC.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeSelectInitialCentroidsResident<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: jlong,
+    k: jint,
+    seed: jlong,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>> {
+        if k <= 0 {
+            return Err(Error::input_error(format!("k must be > 0, got {k}")));
+        }
+        let centroids = select_initial_centroids_resident(session_id, k as usize, seed as u64)?;
+        fsl_to_centroids_ipc(&centroids)
+    })();
+    match result {
+        Ok(bytes) => env
+            .byte_array_from_slice(&bytes)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Driver assembly: train the PQ codebook on the resident driver sample (from
+/// `nativeLoadDriverSample`) with the converged `centroids_ipc`, and return the full
+/// `BroadcastPayload` the shard-build phase consumes — the sample is never collected
+/// onto the JVM heap.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeAssemblePayloadResident<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: jlong,
+    centroids_ipc: JByteArray<'local>,
+    num_partitions: jint,
+    num_sub_vectors: jint,
+    num_bits_per_sub_vector: jint,
+    metric: JString<'local>,
+    max_iters: jint,
+    sample_rate: jint,
+    seed: jlong,
+    rerank_store: JString<'local>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>> {
+        let centroids = ipc_to_centroids_fsl(&mut env, &centroids_ipc)?;
+        let params = params_from_args(
+            &mut env,
+            num_partitions,
+            num_sub_vectors,
+            num_bits_per_sub_vector,
+            metric,
+            max_iters,
+            sample_rate,
+            seed,
+            rerank_store,
+        )?;
+        let payload = assemble_payload_resident(session_id, centroids, &params)?;
+        Ok(payload.to_bytes())
+    })();
+    match result {
+        Ok(bytes) => env
+            .byte_array_from_slice(&bytes)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => {
+            let _ = env.throw(("java/io/IOException", format!("{e}")));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Drop every resident sample for `session_id` (driver + executor). Returns the number
+/// of entries freed. Best-effort cleanup — never throws.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeFreeResidentSamples(
+    _env: JNIEnv,
+    _class: JClass,
+    session_id: jlong,
+) -> jint {
+    free_resident_samples(session_id) as jint
 }
 
 #[unsafe(no_mangle)]
@@ -591,7 +896,8 @@ fn inner_search_flat<'local>(
 
     let q_slice: &[f32] = &q_buf;
     let batch: Vec<Vec<SearchResult>> = RT.block_on(async {
-        idx.search_flat(std::slice::from_ref(&q_slice), k as usize).await
+        idx.search_flat(std::slice::from_ref(&q_slice), k as usize)
+            .await
     })?;
     let results = batch.into_iter().next().unwrap_or_default();
 
@@ -614,7 +920,9 @@ fn inner_search_flat<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeSearchBatch<'local>(
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeSearchBatch<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -687,8 +995,7 @@ fn inner_search_batch<'local>(
     let result_array_class = env.find_class("[Lorg/lance/index/external/SearchResult;")?;
     let outer = env.new_object_array(batched.len() as i32, &result_array_class, JObject::null())?;
     for (qi, results) in batched.iter().enumerate() {
-        let inner =
-            env.new_object_array(results.len() as i32, &result_class, JObject::null())?;
+        let inner = env.new_object_array(results.len() as i32, &result_class, JObject::null())?;
         for (i, r) in results.iter().enumerate() {
             let path = env.new_string(&r.file_path)?;
             let obj = env.new_object(
@@ -795,9 +1102,8 @@ pub(crate) fn record_batch_to_ipc_jbytes(
             .finish()
             .map_err(|e| Error::io_error(format!("ipc finish: {e}")))?;
     }
-    let jbyte_slice: &[jni::sys::jbyte] = unsafe {
-        std::slice::from_raw_parts(buf.as_ptr() as *const jni::sys::jbyte, buf.len())
-    };
+    let jbyte_slice: &[jni::sys::jbyte] =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const jni::sys::jbyte, buf.len()) };
     let array = env.new_byte_array(buf.len() as i32)?;
     env.set_byte_array_region(&array, 0, jbyte_slice)?;
     Ok(array.into_raw())
@@ -830,7 +1136,9 @@ pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeNu
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeVectorColumn<'local>(
+pub extern "system" fn Java_org_lance_index_external_ExternalIvfPqIndex_nativeVectorColumn<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,

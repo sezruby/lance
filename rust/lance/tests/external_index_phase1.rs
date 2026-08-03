@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::print_stdout)]
+
 //! Phase 1 integration tests: drive only the public `ExternalIvfPqIndex` API
 //! (build / open / search / fetch_rows + RowFilter). These mirror the two
 //! existing PoC tests (`external_index_poc.rs`, `external_index_parquet_poc.rs`)
@@ -123,9 +125,8 @@ fn brute_force_topk_global(
         let n = vectors.len();
         for i in 0..n {
             let mut s = 0.0f32;
-            for d in 0..dim {
+            for (d, q) in query.iter().enumerate() {
                 let v = values.value(i * dim + d);
-                let q = query[d];
                 let diff = v - q;
                 s += diff * diff;
             }

@@ -17,11 +17,12 @@ use lance_linalg::distance::MetricType;
 ///
 /// This is orthogonal to the coarse index type: it is "store the vector for
 /// reranking" independent of how candidates are found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RerankStore {
     /// No rerank store. Refinement reads originals from the source parquet
     /// (`refine_factor > 1`), or is skipped entirely (`refine_factor == 1`,
     /// PQ-approx distances only). This is the default — it adds no storage.
+    #[default]
     None,
     /// Scalar-quantized (int8) originals, ≈`dim` bytes/row (4× smaller than raw
     /// f32). Refinement reads a contiguous byte range per candidate and reranks
@@ -34,12 +35,6 @@ pub enum RerankStore {
     /// page-decode-free read path as SQ8; the only difference is precision vs
     /// footprint. L2 / Cosine metrics only.
     Flat,
-}
-
-impl Default for RerankStore {
-    fn default() -> Self {
-        RerankStore::None
-    }
 }
 
 /// Configuration for [`super::ExternalIvfPqIndex::build`].

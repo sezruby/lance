@@ -2971,6 +2971,7 @@ impl Scanner {
         &self,
         filter_plan: &mut FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let _vss_t = std::time::Instant::now();
         if self.include_deleted_rows {
             return Err(Error::invalid_input_source(
                 "Cannot include deleted rows in a nearest neighbor search".into(),
@@ -2981,6 +2982,12 @@ impl Scanner {
         };
 
         if self.prefilter {
+            log::info!(
+                "lance_vector_search_source prefilter=true \
+                 use_scalar_index={} fast_search={}",
+                self.use_scalar_index,
+                self.fast_search
+            );
             log::trace!("source is a vector search (prefilter)");
             // If we are prefiltering then the ann / knn node will take care of the filter
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
@@ -3503,6 +3510,7 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         q: &Query,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let _t_vs = std::time::Instant::now();
         let mut q = q.clone();
 
         // Sanity check
@@ -3510,11 +3518,18 @@ impl Scanner {
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
         let use_index = q.use_index;
+        let _t_load_indices = std::time::Instant::now();
         let indices = if use_index {
             self.dataset.load_indices().await?
         } else {
             Arc::new(vec![])
         };
+        log::info!(
+            "lance_vector_search load_indices={}ms use_index={} num_indices={}",
+            _t_load_indices.elapsed().as_millis(),
+            use_index,
+            indices.len()
+        );
         let index_and_segments = if use_index {
             if let Some(requested_segments) = self.index_segments.as_ref() {
                 let requested_segment_set =
@@ -4403,9 +4418,14 @@ impl Scanner {
         index: &[IndexMetadata],
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let _t_ann = std::time::Instant::now();
         let prefilter_source = self
             .prefilter_source(filter_plan, self.get_indexed_frags(index))
             .await?;
+        log::info!(
+            "lance_ann prefilter_source_built={}ms",
+            _t_ann.elapsed().as_millis()
+        );
         let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -4686,6 +4706,16 @@ pub struct DatasetRecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
     span: Span,
+    /// Wall-clock timestamp when the stream was constructed. Used to attribute
+    /// "time to first row" to plan-execution startup vs subsequent batch decode.
+    created_at: std::time::Instant,
+    /// `None` until the first batch is polled; then `Some(elapsed_ms)`. Logged
+    /// once on first batch arrival to discriminate stream-draining cost
+    /// (probe + index loads + refinement reads) from plan-build cost.
+    first_batch_ms: Option<u128>,
+    /// Cumulative count of batches drained for this stream. Logged on Drop
+    /// so we see whether this stream produced 1 batch or many.
+    batch_count: usize,
 }
 
 impl DatasetRecordBatchStream {
@@ -4699,7 +4729,13 @@ impl DatasetRecordBatchStream {
         };
 
         let span = info_span!("DatasetRecordBatchStream");
-        Self { exec_node, span }
+        Self {
+            exec_node,
+            span,
+            created_at: std::time::Instant::now(),
+            first_batch_ms: None,
+            batch_count: 0,
+        }
     }
 }
 
@@ -4716,7 +4752,30 @@ impl Stream for DatasetRecordBatchStream {
         let mut this = self.project();
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
-            Poll::Ready(result) => Poll::Ready(result.map(|r| Ok(r?))),
+            Poll::Ready(Some(Ok(batch))) => {
+                if this.first_batch_ms.is_none() {
+                    let ms = this.created_at.elapsed().as_millis();
+                    *this.first_batch_ms = Some(ms);
+                    log::info!(
+                        "lance_stream_first_batch ms={} rows={}",
+                        ms,
+                        batch.num_rows()
+                    );
+                }
+                *this.batch_count += 1;
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => {
+                let total_ms = this.created_at.elapsed().as_millis();
+                log::info!(
+                    "lance_stream_done total_ms={} batches={} ttf_batch_ms={}",
+                    total_ms,
+                    this.batch_count,
+                    this.first_batch_ms.unwrap_or(0)
+                );
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }

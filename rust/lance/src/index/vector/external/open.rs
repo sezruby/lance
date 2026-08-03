@@ -119,13 +119,12 @@ pub async fn open_index(uri: &str) -> Result<OpenedExternalIndex> {
 
 fn decode_pb_index(pb_index: &pb::Index) -> Result<(IvfModel, ProductQuantizer, DistanceType)> {
     use lance_index::pb::vector_index_stage::Stage;
-    let vec_idx = match pb_index.implementation.as_ref() {
-        Some(lance_index::pb::index::Implementation::VectorIndex(v)) => v,
-        _ => {
-            return Err(Error::index(
-                "external index file is not a VectorIndex".to_string(),
-            ));
-        }
+    let Some(lance_index::pb::index::Implementation::VectorIndex(vec_idx)) =
+        pb_index.implementation.as_ref()
+    else {
+        return Err(Error::index(
+            "external index file is not a VectorIndex".to_string(),
+        ));
     };
     let metric: DistanceType =
         lance_index::pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();

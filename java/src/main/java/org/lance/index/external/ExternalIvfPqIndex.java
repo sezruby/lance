@@ -307,7 +307,163 @@ public final class ExternalIvfPqIndex implements AutoCloseable {
         sidecarRows);
   }
 
+  // ---- distributed phase-1 build: sample READ + training convergence --------
+
+  /**
+   * Distributed-READ sampling step: draw {@code sampleSize} training rows from this shard's {@code
+   * shardFiles} and write them to {@code outUri} as a compact single-column parquet; returns the
+   * number of rows written. Run per shard on executors so the ~1000-file random-access sample scan
+   * is parallelized across the cluster.
+   *
+   * <p>The sample is kept OFF the JVM heap: rather than {@code collect()}ing multi-GiB IPC chunks
+   * onto the driver, the driver trains over the union of these compact files via the ordinary
+   * {@link #trainBroadcast}, native and off-heap.
+   */
+  public static long sampleShardToParquet(
+      List<String> shardFiles, String vectorColumn, int sampleSize, String outUri) {
+    return nativeSampleShardToParquet(
+        shardFiles.toArray(new String[0]), vectorColumn, sampleSize, outUri);
+  }
+
+  /**
+   * Convergence probe: the total assignment loss carried by a reduced {@code PartialStats} batch
+   * ({@code statsIpc}). Stop the Lloyd loop when the relative loss delta between iterations falls
+   * under your tolerance.
+   */
+  public static double totalLoss(byte[] statsIpc) {
+    return nativeTotalLoss(statsIpc);
+  }
+
+  // ---- off-JVM resident-sample training (Ray-portable) ----------------------
+
+  /**
+   * Off-JVM executor E-step: assign this shard's resident training sample — loaded on first touch
+   * from {@code shardFiles} and cached under {@code (sessionId, shardId)} — to the broadcast {@code
+   * centroidsIpc}, returning the per-cluster {@code PartialStats} IPC. The sample vectors stay in
+   * native memory across Lloyd iterations, so only ids, file paths and centroid bytes cross the JNI
+   * boundary. Fold the per-shard outputs with {@link
+   * org.lance.index.vector.DistributedKMeans#mergePartialStats}.
+   */
+  public static byte[] computePartialStatsResident(
+      long sessionId,
+      int shardId,
+      List<String> shardFiles,
+      String vectorColumn,
+      int sampleSize,
+      byte[] centroidsIpc,
+      ExternalIvfPqIndexParams.Metric metric) {
+    return nativeComputePartialStatsResident(
+        sessionId,
+        shardId,
+        shardFiles.toArray(new String[0]),
+        vectorColumn,
+        sampleSize,
+        centroidsIpc,
+        metric.toRustString());
+  }
+
+  /**
+   * Off-JVM driver setup: read every shard's training sample once into a single native resident
+   * sample keyed by {@code sessionId}, feeding {@link #selectInitialCentroidsResident} (init) and
+   * {@link #assemblePayloadResident} (PQ). {@code fileGroups} is the per-shard file lists; it is
+   * flattened with a parallel group-size array so the sample never enters JVM heap. Returns the
+   * resident sample's row count.
+   */
+  public static long loadDriverSample(
+      long sessionId, List<List<String>> fileGroups, String vectorColumn, int perShardSample) {
+    int total = 0;
+    for (List<String> g : fileGroups) {
+      total += g.size();
+    }
+    String[] flat = new String[total];
+    int[] groupSizes = new int[fileGroups.size()];
+    int idx = 0;
+    for (int i = 0; i < fileGroups.size(); i++) {
+      List<String> g = fileGroups.get(i);
+      groupSizes[i] = g.size();
+      for (String f : g) {
+        flat[idx++] = f;
+      }
+    }
+    return nativeLoadDriverSample(sessionId, flat, groupSizes, vectorColumn, perShardSample);
+  }
+
+  /**
+   * Off-JVM driver init: pick {@code k} initial centroids from the resident driver sample loaded by
+   * {@link #loadDriverSample}. Returns centroids IPC.
+   */
+  public static byte[] selectInitialCentroidsResident(long sessionId, int k, long seed) {
+    return nativeSelectInitialCentroidsResident(sessionId, k, seed);
+  }
+
+  /**
+   * Off-JVM driver assembly: train the PQ codebook on the resident driver sample (from {@link
+   * #loadDriverSample}) using the converged {@code centroidsIpc}, and return the opaque broadcast
+   * payload {@link #trainBroadcast} would — hand it straight to {@link #buildShard} / {@link
+   * #mergeShards}.
+   */
+  public static byte[] assemblePayloadResident(
+      long sessionId, byte[] centroidsIpc, ExternalIvfPqIndexParams params) {
+    return nativeAssemblePayloadResident(
+        sessionId,
+        centroidsIpc,
+        params.getNumPartitions(),
+        params.getNumSubVectors(),
+        params.getNumBitsPerSubVector(),
+        params.getMetric().toRustString(),
+        params.getMaxIters(),
+        params.getSampleRate(),
+        params.getSeed(),
+        params.getRerankStore().toRustString());
+  }
+
+  /**
+   * Drop every resident sample for {@code sessionId} — call once training converges. Returns the
+   * number of entries freed; best-effort, never throws.
+   */
+  public static int freeResidentSamples(long sessionId) {
+    return nativeFreeResidentSamples(sessionId);
+  }
+
   // ---- native methods -------------------------------------------------------
+
+  private static native long nativeSampleShardToParquet(
+      String[] shardFiles, String vectorColumn, int sampleSize, String outUri);
+
+  private static native double nativeTotalLoss(byte[] statsIpc);
+
+  private static native byte[] nativeComputePartialStatsResident(
+      long sessionId,
+      int shardId,
+      String[] shardFiles,
+      String vectorColumn,
+      int sampleSize,
+      byte[] centroidsIpc,
+      String metric);
+
+  private static native long nativeLoadDriverSample(
+      long sessionId,
+      String[] flatFiles,
+      int[] groupSizes,
+      String vectorColumn,
+      int perShardSample);
+
+  private static native byte[] nativeSelectInitialCentroidsResident(
+      long sessionId, int k, long seed);
+
+  private static native byte[] nativeAssemblePayloadResident(
+      long sessionId,
+      byte[] centroidsIpc,
+      int numPartitions,
+      int numSubVectors,
+      int numBitsPerSubVector,
+      String metric,
+      int maxIters,
+      int sampleRate,
+      long seed,
+      String rerankStore);
+
+  private static native int nativeFreeResidentSamples(long sessionId);
 
   private static native byte[] nativeTrainBroadcast(
       String[] filePaths,

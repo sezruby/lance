@@ -65,7 +65,12 @@ impl BlockingScanner {
 
     pub fn open_stream(&self) -> Result<DatasetRecordBatchStream> {
         self.reset_stats();
+        let t = std::time::Instant::now();
         let res = RT.block_on(self.inner.try_into_stream())?;
+        log::info!(
+            "lance_jni_open_stream try_into_stream={}ms",
+            t.elapsed().as_millis()
+        );
         Ok(res)
     }
 

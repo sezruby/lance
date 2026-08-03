@@ -61,10 +61,10 @@ pub(super) async fn search_keys(
                 ))
             })?
             .to_string();
-        if let Some(f) = filter {
-            if !f.keep(&file_path, row_index) {
-                continue;
-            }
+        if let Some(f) = filter
+            && !f.keep(&file_path, row_index)
+        {
+            continue;
         }
         out.push(SearchResult {
             file_path,

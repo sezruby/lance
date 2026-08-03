@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::FixedSizeListArray;
+use arrow_array::{Array, FixedSizeListArray};
 use futures::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
@@ -182,36 +182,64 @@ pub(super) async fn train_quantizers(
     source: &ParquetVectorSource,
     params: &ExternalIvfPqIndexParams,
 ) -> Result<(IvfModel, ProductQuantizer, FixedSizeListArray)> {
+    let num_rows = source.num_rows().await? as usize;
     let sample_size = (params.num_partitions * params.sample_rate)
-        .min(source.num_rows().await? as usize)
+        .min(num_rows)
         .max(params.num_partitions);
     let training = source.sample(sample_size).await?;
+    train_quantizers_from_sample(training, params)
+}
+
+/// Train IVF centroids + the PQ codebook from an already-materialized training
+/// `sample` — the compute half of [`train_quantizers`] with no parquet I/O. The
+/// distributed-read build (executors read their shard's sample and ship it to the
+/// driver, then the driver trains here) shares this with the single-box path, so both
+/// derive bit-for-bit identical models from the same sample. Pure compute.
+pub(super) fn train_quantizers_from_sample(
+    training: FixedSizeListArray,
+    params: &ExternalIvfPqIndexParams,
+) -> Result<(IvfModel, ProductQuantizer, FixedSizeListArray)> {
     let kmeans = KMeans::new(&training, params.num_partitions, params.max_iters as u32)
         .map_err(|e| Error::index(format!("kmeans training failed: {e}")))?;
     let centroids =
         FixedSizeListArray::try_new_from_values(kmeans.centroids.clone(), kmeans.dimension as i32)
             .map_err(|e| Error::index(format!("kmeans centroids → FixedSizeListArray: {e}")))?;
-    let ivf = IvfModel::new(centroids.clone(), None);
+    let (ivf, pq) = build_pq_from_centroids(&training, centroids, params)?;
+    Ok((ivf, pq, training))
+}
 
-    // Train the PQ codebook on RESIDUALS (vector − assigned centroid), not raw vectors,
-    // for L2/Cosine. This mirrors Lance-core's IVF-PQ build (`build_pq_model` computes the
-    // residual of the training sample before `PQBuildParams::build`). It is required for
-    // correctness, not just quality: the encode path (`IvfTransformer::with_pq`) auto-inserts
-    // a ResidualTransform for these metrics, so PQ codes are applied in residual space —
-    // training the codebook on raw vectors would mismatch train vs encode distributions and
-    // materially drops recall. Dot product does not use residuals (matches `use_residual`).
+/// Given IVF `centroids` and the training `sample`, wrap the centroids into an
+/// [`IvfModel`] and train the PQ codebook. Factored out of [`train_quantizers`] so
+/// the distributed build can inject centroids trained across the cluster
+/// (see [`super::distributed::assemble_broadcast_payload_from_centroids`]) while
+/// reusing the exact PQ / residual logic — the two paths must agree bit-for-bit on
+/// how the codebook is derived from a given `(sample, centroids)` pair.
+///
+/// Train the PQ codebook on RESIDUALS (vector − assigned centroid), not raw vectors,
+/// for L2/Cosine. This mirrors Lance-core's IVF-PQ build (`build_pq_model` computes the
+/// residual of the training sample before `PQBuildParams::build`). It is required for
+/// correctness, not just quality: the encode path (`IvfTransformer::with_pq`) auto-inserts
+/// a ResidualTransform for these metrics, so PQ codes are applied in residual space —
+/// training the codebook on raw vectors would mismatch train vs encode distributions and
+/// materially drops recall. Dot product does not use residuals (matches `use_residual`).
+pub(super) fn build_pq_from_centroids(
+    training: &FixedSizeListArray,
+    centroids: FixedSizeListArray,
+    params: &ExternalIvfPqIndexParams,
+) -> Result<(IvfModel, ProductQuantizer)> {
+    let ivf = IvfModel::new(centroids.clone(), None);
     let use_residual = matches!(params.metric, MetricType::L2 | MetricType::Cosine);
     let pq_training = if use_residual {
         let ivf_transformer =
             lance_index::vector::ivf::new_ivf_transformer(centroids, MetricType::L2, vec![]);
-        ivf_transformer.compute_residual(&training)?
+        ivf_transformer.compute_residual(training)?
     } else {
         training.clone()
     };
     let pq = PQBuildParams::new(params.num_sub_vectors, params.num_bits_per_sub_vector)
         .build(&pq_training, params.metric)
         .map_err(|e| Error::index(format!("PQ training failed: {e}")))?;
-    Ok((ivf, pq, training))
+    Ok((ivf, pq))
 }
 
 /// Assign + PQ-encode every row of `source` into partition-binned streams, using
@@ -237,7 +265,7 @@ pub(super) async fn shard_partition_streams(
         .clone();
     let transformer = Arc::new(IvfTransformer::with_pq(
         centroids,
-        params.metric.into(),
+        params.metric,
         vector_column,
         pq.clone(),
         None,
@@ -294,6 +322,7 @@ fn batches_to_streams(
 /// single-box build (see the `distributed_matches_single_box` test). The real
 /// distributed build runs the same three phases across executors via JNI; this
 /// function is the local correctness oracle for that design.
+#[cfg(test)]
 pub(super) async fn build_index_from_shards_local(
     files: Vec<ParquetFileSpec>,
     vector_column: &str,

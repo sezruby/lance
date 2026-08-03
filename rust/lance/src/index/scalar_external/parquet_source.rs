@@ -164,8 +164,11 @@ pub(super) async fn sorted_value_rowid_stream(
     let source: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::new(Box::pin(input_stream)));
 
     let sort_expr = PhysicalSortExpr::new_default(
-        col(VALUE_COLUMN_NAME, out_schema.as_ref())
-            .map_err(|e| Error::io(format!("failed to resolve '{VALUE_COLUMN_NAME}' column: {e}")))?,
+        col(VALUE_COLUMN_NAME, out_schema.as_ref()).map_err(|e| {
+            Error::io(format!(
+                "failed to resolve '{VALUE_COLUMN_NAME}' column: {e}"
+            ))
+        })?,
     );
     let sort = Arc::new(SortExec::new([sort_expr].into(), source));
     sort.execute(0, Arc::new(TaskContext::default()))

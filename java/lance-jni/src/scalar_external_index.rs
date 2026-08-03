@@ -29,10 +29,10 @@ use lance::index::scalar_external::{
     SearchResult,
 };
 
+use crate::RT;
 use crate::error::{Error, Result};
 use crate::external_index::{build_filter_from_bytes, record_batch_to_ipc_jbytes};
 use crate::traits::FromJString;
-use crate::RT;
 
 // ---- build / open / close -----------------------------------------------------
 

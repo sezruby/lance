@@ -68,20 +68,20 @@ pub(super) enum RerankKind {
 impl RerankKind {
     fn tag(self) -> &'static str {
         match self {
-            RerankKind::Sq8 => "sq8",
-            RerankKind::Flat => "flat",
+            Self::Sq8 => "sq8",
+            Self::Flat => "flat",
         }
     }
     fn file_name(self) -> &'static str {
         match self {
-            RerankKind::Sq8 => RERANK_SQ8_FILE_NAME,
-            RerankKind::Flat => RERANK_FLAT_FILE_NAME,
+            Self::Sq8 => RERANK_SQ8_FILE_NAME,
+            Self::Flat => RERANK_FLAT_FILE_NAME,
         }
     }
     fn from_tag(tag: &str) -> Option<Self> {
         match tag {
-            "sq8" => Some(RerankKind::Sq8),
-            "flat" => Some(RerankKind::Flat),
+            "sq8" => Some(Self::Sq8),
+            "flat" => Some(Self::Flat),
             _ => None,
         }
     }
@@ -360,13 +360,13 @@ impl RerankReader {
         let mut sorted: Vec<u64> = ordinals.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        if let Some(&last) = sorted.last() {
-            if last >= self.meta.total_rows {
-                return Err(Error::invalid_input(format!(
-                    "rerank fetch: ordinal {last} out of range ({} rows)",
-                    self.meta.total_rows
-                )));
-            }
+        if let Some(&last) = sorted.last()
+            && last >= self.meta.total_rows
+        {
+            return Err(Error::invalid_input(format!(
+                "rerank fetch: ordinal {last} out of range ({} rows)",
+                self.meta.total_rows
+            )));
         }
 
         // Build the list of (segment_index, global_run_start, global_run_end) ranges to read.

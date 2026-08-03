@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use arrow::compute::concat;
 use arrow_array::{
-    new_empty_array, Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch,
-    UInt64Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch, UInt64Array,
+    new_empty_array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
@@ -110,45 +110,62 @@ impl ParquetVectorSource {
         Ok(total)
     }
 
-    /// Sample up to `n` vectors for kmeans + PQ training, spread across each file's FULL row
-    /// range rather than its first rows (strided by default, or random via
-    /// `LANCE_EXT_SAMPLE_STRATEGY=random`).
+    /// Sample up to `n` vectors for kmeans + PQ training, spread across each file's row range
+    /// rather than its first rows.
     ///
     /// Why spread across the range, not first-N: source parquet is frequently value-ordered
     /// (e.g. Wikipedia embeddings are laid out article-by-article, so consecutive rows are
     /// paragraphs of the same document). A first-N-per-file sample is then a highly correlated,
     /// low-diversity slice — it trains centroids + codebook on a skewed sub-distribution and
-    /// measurably drops recall. The read stays cheap because `RowSelection` uses the parquet
-    /// page/offset index to skip unselected rows (the same mechanism as the refinement fetch),
-    /// so we page-decode only the rows we keep.
+    /// measurably drops recall. The read is kept cheap by sampling a phase-staggered SUBSET of
+    /// each file's row groups (see [`read_range_spread_vectors`]): index-less parquet fetches a
+    /// whole column chunk per row group touched, so reading fewer groups — not a finer selection
+    /// — is what cuts I/O. Diversity is preserved by striding within the chosen groups and
+    /// staggering the group choice per file so the corpus-wide union covers every group.
     ///
-    /// Reproducible: the per-file phase / RNG seed is derived from the file's position, so the
-    /// sample — and thus the trained index — is stable across runs.
+    /// Reproducible: the per-file phase is derived from the file's position, so the sample — and
+    /// thus the trained index — is stable across runs.
     pub async fn sample(&self, n: usize) -> Result<FixedSizeListArray> {
+        use futures::stream::{self, StreamExt};
+
+        // Give every file an equal share of the budget and read them CONCURRENTLY.
+        // A sequential loop here is round-trip-bound — each file costs a few object-store
+        // round trips (async open + column-chunk fetch) — and at 1000+ files that serial
+        // chain dominated the entire build (the driver train phase). Files are independent,
+        // so a bounded buffered stream cuts it to `ceil(num_files / concurrency)` waves.
+        // Large-scale runs showed `sample_read` is bound by this concurrency, not per-file
+        // bytes or opens (see [`SAMPLE_PARALLEL_FILES_DEFAULT`]), so the width is the driver lever.
+        //
+        // `.buffered` (order-preserving), not `buffer_unordered`: the concatenation order
+        // must stay file-order so the trained index is reproducible across runs (kmeans
+        // init reads the training array by index). Completion-order concat would make the
+        // sample — and thus the centroids — depend on nondeterministic I/O timing.
         let per_file = n.div_ceil(self.files.len()).max(1);
-        let mut accumulated: Vec<ArrayRef> = Vec::new();
-        let mut total = 0usize;
-
-        for (file_idx, spec) in self.files.iter().enumerate() {
-            if total >= n {
-                break;
-            }
-            let want = (n - total).min(per_file);
-            let fsl = read_range_spread_vectors(
-                &spec.file_path,
-                &self.vector_column,
-                want,
-                file_idx as u64,
-            )
+        let vector_column = self.vector_column.clone();
+        let dim = self.dim;
+        let chunks: Vec<FixedSizeListArray> = stream::iter(self.files.iter().enumerate())
+            .map(|(file_idx, spec)| {
+                let path = spec.file_path.clone();
+                let column = vector_column.clone();
+                async move {
+                    read_range_spread_vectors(&path, &column, per_file, file_idx as u64, dim).await
+                }
+            })
+            .buffered(sample_parallel_files())
+            .try_collect()
             .await?;
-            total += fsl.len();
-            accumulated.push(Arc::new(fsl));
-        }
 
-        let array_refs: Vec<&dyn Array> = accumulated.iter().map(|a| a.as_ref()).collect();
+        let array_refs: Vec<&dyn Array> = chunks.iter().map(|a| a as &dyn Array).collect();
         let concatenated = concat(&array_refs).map_err(|e| {
             Error::invalid_input(format!("failed to concatenate sample batches: {e}"))
         })?;
+        // Equal per-file budgeting can overshoot `n` by up to `num_files - 1` rows
+        // (div_ceil rounding); trim to the requested sample size.
+        let concatenated = if concatenated.len() > n {
+            concatenated.slice(0, n)
+        } else {
+            concatenated
+        };
         let fsl = concatenated
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
@@ -187,8 +204,7 @@ impl ParquetVectorSource {
         )
         .await?;
 
-        let stream =
-            futures::stream::iter(batches.into_iter().map(|b| Ok::<RecordBatch, Error>(b)));
+        let stream = futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, Error>));
         Ok(RecordBatchStreamAdapter::new(out_schema, stream))
     }
 }
@@ -236,13 +252,41 @@ const REFINEMENT_COALESCE_GAP: u64 = 4 * 1024 * 1024;
 /// straightforward win on Azure / S3.
 const REFINEMENT_PARALLEL_RANGES: usize = 32;
 
+/// Default number of parquet files sampled concurrently during training
+/// ([`ParquetVectorSource::sample`]); override with `LANCE_EXT_SAMPLE_PARALLEL_FILES`.
+///
+/// The per-file sample read is round-trip-bound — each file costs a few object-store
+/// round trips (async open + column-chunk fetch) — so at 1000+ files a sequential loop
+/// dominates the build (the driver train phase). Files are independent, so a bounded
+/// buffered stream collapses that chain to `ceil(num_files / concurrency)` waves.
+///
+/// 100M-row runs showed the driver `sample_read` (~250s) is insensitive to per-file
+/// BYTES (full 193MB/file vs a 58MB row-group subset: no change) and to per-file OPENS
+/// (removing a redundant 19MB dim re-probe + one open: no change) — the ceiling is the
+/// single driver node's aggregate request handling at this concurrency, not per-file
+/// work. Raising concurrency is therefore the driver-only lever (above it: distribute
+/// the read across executors). Bounded rather than unbounded to cap driver memory: each
+/// in-flight file materializes about `per_file * dim * 4` bytes of f32 vectors, so the
+/// safe ceiling scales inversely with `per_file` and the row-group subset size.
+const SAMPLE_PARALLEL_FILES_DEFAULT: usize = 64;
+
+/// Concurrency for the training sample read, from `LANCE_EXT_SAMPLE_PARALLEL_FILES`
+/// (falls back to [`SAMPLE_PARALLEL_FILES_DEFAULT`]). Clamped to at least 1.
+fn sample_parallel_files() -> usize {
+    std::env::var("LANCE_EXT_SAMPLE_PARALLEL_FILES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(SAMPLE_PARALLEL_FILES_DEFAULT)
+        .max(1)
+}
+
 /// Wrapper around [`ParquetObjectReader`] that overrides `get_byte_ranges` to
 /// coalesce ranges with a larger gap and fetch more in parallel than the
 /// `object_store::coalesce_ranges` defaults. Significantly reduces refinement
 /// latency on cloud storage where per-request RTT dominates.
 ///
 /// All other `AsyncFileReader` methods delegate to the inner reader unchanged.
-pub(crate) struct CoalescingParquetReader {
+pub struct CoalescingParquetReader {
     inner: ParquetObjectReader,
     /// Reference to the same object_store the inner reader uses, so our
     /// custom `get_byte_ranges` can issue the coalesced fetch directly.
@@ -384,7 +428,7 @@ fn slice_merged(
 /// The cache lives on [`super::OpenedExternalIndex`] so its lifetime matches
 /// one task's worth of queries; per-task is enough to amortize the overhead
 /// across all queries running on the task.
-pub(crate) struct ParquetMetaCache {
+pub struct ParquetMetaCache {
     inner: Mutex<HashMap<String, CachedFile>>,
 }
 
@@ -420,7 +464,7 @@ impl std::fmt::Debug for ParquetMetaCache {
 /// Returns the [`ParquetRecordBatchStreamBuilder`] which the caller turns into
 /// a stream via `.with_projection(...).build()`. The async reader supports the
 /// same options as the sync one (page index, row selection, projection mask).
-pub(crate) async fn open_parquet_async(
+pub async fn open_parquet_async(
     path: &str,
 ) -> Result<ParquetRecordBatchStreamBuilder<CoalescingParquetReader>> {
     open_parquet_async_with_options(path, ArrowReaderOptions::new()).await
@@ -574,7 +618,7 @@ async fn read_num_rows(path: &str) -> Result<u64> {
 /// Coerce a column array (FixedSizeList or List) to FixedSizeListArray, validating that
 /// every row has length `expected_dim`. Spark and most JVM parquet writers emit List, so
 /// this is the common-case path.
-pub(crate) fn coerce_to_fsl(col: &ArrayRef, expected_dim: usize) -> Result<FixedSizeListArray> {
+pub fn coerce_to_fsl(col: &ArrayRef, expected_dim: usize) -> Result<FixedSizeListArray> {
     if let Some(fsl) = col.as_any().downcast_ref::<FixedSizeListArray>() {
         if fsl.value_length() as usize != expected_dim {
             return Err(Error::invalid_input(format!(
@@ -634,77 +678,97 @@ pub(crate) fn coerce_to_fsl(col: &ArrayRef, expected_dim: usize) -> Result<Fixed
     )))
 }
 
-/// Read up to `n` vectors from `path`, spread across the file's FULL row range (not the
-/// first `n`). Strategy is chosen by env `LANCE_EXT_SAMPLE_STRATEGY` ("strided" default, or
-/// "random"); `seed_salt` (the file's position) staggers per-file offsets so files don't all
-/// sample the same relative positions, and keeps the sample reproducible.
+/// Read up to `n` vectors from `path`, spread across the file's row range by sampling a
+/// PHASE-STAGGERED SUBSET of its row groups. `seed_salt` (the file's position in the manifest)
+/// shifts both which row groups this file reads and the intra-group stride phase, so different
+/// files sample different groups — the union across the corpus still covers every row group —
+/// while keeping the sample reproducible.
 ///
-/// Spreading across the range (vs first-N) matters on value-ordered corpora (e.g. Wikipedia
-/// embeddings laid out article-by-article): a first-N slice is a correlated, low-diversity
-/// training set that drops recall. Either strategy uses a `RowSelection` so the parquet reader
-/// skips unselected rows via the page/offset index (loaded with `PageIndexPolicy::Required`) —
-/// it page-decodes only the kept rows, not the whole file. See [`ParquetVectorSource::sample`].
+/// Row-group subset, and why it is a SECONDARY lever here: the Cohere corpus (like many
+/// Arrow/Spark-written parquet files) carries NO page/offset index, so parquet-rs fetches the
+/// ENTIRE column chunk of every row group it touches — a `RowSelection` only prunes *decode*,
+/// never I/O (`in_memory_row_group.rs::fetch_ranges`, else-branch). A stride that lands in all
+/// row groups therefore reads the whole column, and reading only `k` groups is the one thing that
+/// cuts bytes read (≈ k / num_row_groups). BUT an A/B showed the driver sample read is
+/// round-trip-bound, not byte-bound: at 3/10 groups sample_read did not beat reading all 10
+/// (~1000 small files at 16-way concurrency, each paying several sequential object-store round
+/// trips per open). So `k` trades recall for bytes with little latency effect; the latency wins
+/// are minimizing per-file opens (see the body — no dim re-probe, no page-index probe) and, above
+/// that, distributing the read across executors. `k` is `LANCE_EXT_SAMPLE_ROWGROUPS` (default
+/// `num_row_groups / 3`, min 1); set it `>= num_row_groups` to read every group. Within the chosen
+/// groups we strided-sample across their combined range for diversity — free, since those chunks
+/// are already fetched. Spreading across the range (vs first-N) matters on value-ordered corpora
+/// (Wikipedia embeddings laid out article-by-article): a correlated, low-diversity training set
+/// drops recall. See [`ParquetVectorSource::sample`].
 async fn read_range_spread_vectors(
     path: &str,
     column: &str,
     n: usize,
     seed_salt: u64,
+    dim: usize,
 ) -> Result<FixedSizeListArray> {
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-
-    let dim = read_vector_dim(path, column).await?;
-    // Page index required so RowSelection can skip cheaply.
-    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-    let builder = open_parquet_async_with_options(path, options).await?;
+    // `dim` is passed in (probed once at source construction), NOT re-read per file: the sample
+    // read is round-trip-bound across ~1000 small files, and for List<Float32> columns
+    // `read_vector_dim` builds a batch-size-1 stream that — with no offset index — fetches a whole
+    // ~19 MB column chunk just to read one row's length. Skipping it removes an open + that chunk
+    // from every file. For the same reason we open with the DEFAULT page-index policy (no probe):
+    // these files carry no page/offset index, so requiring it only adds a wasted footer-region read
+    // and a RowSelection cannot prune I/O regardless (we cut bytes via the row-group subset below).
+    let builder = open_parquet_async(path).await?;
     let total_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    let num_row_groups = builder.metadata().num_row_groups();
     let mask = ProjectionMask::columns(builder.parquet_schema(), [column]);
 
-    if total_rows == 0 || n == 0 {
+    if total_rows == 0 || n == 0 || num_row_groups == 0 {
         let empty = new_empty_array(&DataType::Float32);
-        let f32 = empty.as_any().downcast_ref::<Float32Array>().unwrap().clone();
+        let f32 = empty
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .clone();
         return FixedSizeListArray::try_new_from_values(f32, dim as i32)
             .map_err(|e| Error::invalid_input(format!("empty FSL construction failed: {e}")));
     }
 
-    // Pick `want` row indices across the FULL range. Two strategies (env
-    // `LANCE_EXT_SAMPLE_STRATEGY`, default "strided"):
-    //   - "strided": evenly-spaced offsets (phase-shifted per file). Guarantees uniform coverage
-    //     of a value-ordered range; measured best on article-ordered Cohere data.
-    //   - "random": distinct uniform-random offsets (mirrors Lance-core's sample_fsl_uniform).
-    // Both read via the page-index RowSelection below, so cost is identical; only which rows are
-    // trained on differs. Kept as a toggle so the two can be A/B'd against recall directly.
-    let want = n.min(total_rows);
-    let strategy = std::env::var("LANCE_EXT_SAMPLE_STRATEGY").unwrap_or_else(|_| "strided".into());
-    let indices: Vec<usize> = if want == total_rows {
-        (0..total_rows).collect()
-    } else if strategy.eq_ignore_ascii_case("random") {
-        let mut rng = StdRng::seed_from_u64(0xA5A5_5A5A_C0FF_EE00 ^ seed_salt);
-        let mut chosen = std::collections::HashSet::with_capacity(want);
-        while chosen.len() < want {
-            chosen.insert(rng.gen_range(0..total_rows));
-        }
-        let mut v: Vec<usize> = chosen.into_iter().collect();
-        // RowSelection requires strictly increasing ranges.
-        v.sort_unstable();
-        v
-    } else {
-        // Strided: evenly-spaced, offset by a per-file phase so files stagger their samples.
-        let stride = (total_rows / want).max(1);
-        let start = (seed_salt as usize).wrapping_mul(2_654_435_761) % stride;
-        let mut v: Vec<usize> = Vec::with_capacity(want);
-        let mut r = start;
-        while r < total_rows && v.len() < want {
-            v.push(r);
-            r += stride;
-        }
-        v
-    };
-    let ranges: Vec<std::ops::Range<usize>> = indices.iter().map(|&i| i..(i + 1)).collect();
-    let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows);
+    // Choose `k` row groups, evenly spaced and phase-shifted per file. Default reads ~1/3 of the
+    // file's groups (≈1/3 of the column, since I/O ∝ groups read on index-less parquet).
+    let k = std::env::var("LANCE_EXT_SAMPLE_ROWGROUPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| (num_row_groups / 3).max(1))
+        .clamp(1, num_row_groups);
+    let phase = (seed_salt as usize).wrapping_mul(2_654_435_761) % num_row_groups;
+    let mut chosen: Vec<usize> = (0..k)
+        .map(|j| ((j * num_row_groups) / k + phase) % num_row_groups)
+        .collect();
+    chosen.sort_unstable();
+    chosen.dedup();
+
+    // The RowSelection is applied across the chosen groups in order (parquet `split_off`s each
+    // group's `row_count` from it), so it lives in their COMBINED logical row space.
+    let combined_total: usize = chosen
+        .iter()
+        .map(|&i| builder.metadata().row_group(i).num_rows().max(0) as usize)
+        .sum();
+    let want = n.min(combined_total);
+
+    // Strided single-row selection across the combined space, phase-offset per file. Stride shape
+    // is free (all fetched chunks decode fully without an offset index); it only sets which rows
+    // train, so we spread uniformly for diversity.
+    let stride = (combined_total / want.max(1)).max(1);
+    let start = (seed_salt as usize).wrapping_mul(0x9E37_79B9) % stride;
+    let mut idx: Vec<usize> = Vec::with_capacity(want);
+    let mut r = start;
+    while r < combined_total && idx.len() < want {
+        idx.push(r);
+        r += stride;
+    }
+    let ranges = idx.iter().map(|&i| i..(i + 1));
+    let selection = RowSelection::from_consecutive_ranges(ranges, combined_total);
 
     let mut stream = builder
         .with_projection(mask)
+        .with_row_groups(chosen)
         .with_row_selection(selection)
         .build()
         .map_err(|e| parquet_reader_err(path, e))?;
@@ -852,8 +916,12 @@ mod tests {
         assert_eq!(src.num_rows().await.unwrap(), 100);
     }
 
+    // n=60 divides evenly across the 3 files (per_file=20 each → 60). n=58 makes the equal
+    // per-file budget overshoot (20*3=60 read), so the concurrent sampler must trim the
+    // concatenation back to exactly `n`. Both must return exactly `n` rows.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn sample_returns_requested_count() {
+    async fn sample_returns_requested_count(#[values(60, 58)] n: usize) {
         let tmp = TempDir::new().unwrap();
         let mut files = Vec::new();
         for i in 0..3 {
@@ -862,8 +930,8 @@ mod tests {
             files.push(ParquetFileSpec::of(p.to_str().unwrap()));
         }
         let src = ParquetVectorSource::try_new(files, "vec").await.unwrap();
-        let sample = src.sample(60).await.unwrap();
-        assert_eq!(sample.len(), 60);
+        let sample = src.sample(n).await.unwrap();
+        assert_eq!(sample.len(), n);
         assert_eq!(sample.value_length(), 4);
     }
 
@@ -879,9 +947,10 @@ mod tests {
         let p = tmp.path().join("part-0.parquet");
         let (num_rows, dim) = (1000usize, 4usize);
         make_parquet(&p, num_rows, dim, 0.0); // row r → first value r*dim
-        let src = ParquetVectorSource::try_new(vec![ParquetFileSpec::of(p.to_str().unwrap())], "vec")
-            .await
-            .unwrap();
+        let src =
+            ParquetVectorSource::try_new(vec![ParquetFileSpec::of(p.to_str().unwrap())], "vec")
+                .await
+                .unwrap();
         let want = 100usize;
         let sample = src.sample(want).await.unwrap();
         assert_eq!(sample.len(), want);
@@ -904,7 +973,10 @@ mod tests {
              (want={want}); a range-spread sample should reach near {num_rows}"
         );
         // Sampled rows must be distinct (the sampler dedups before building the selection).
-        let distinct = sampled_rows.iter().collect::<std::collections::HashSet<_>>().len();
+        let distinct = sampled_rows
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         assert_eq!(distinct, want, "sampled rows must be distinct");
     }
 

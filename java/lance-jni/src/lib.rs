@@ -45,6 +45,7 @@ mod blocking_dataset;
 mod blocking_scanner;
 mod delta;
 mod dispatcher;
+mod distributed_kmeans;
 pub mod error;
 mod external_index;
 pub mod ffi;

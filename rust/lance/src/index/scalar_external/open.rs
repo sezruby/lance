@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use lance_core::cache::LanceCache;
 use lance_core::Result;
+use lance_core::cache::LanceCache;
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::btree::BTreeIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -27,11 +27,8 @@ pub(super) async fn open_index(uri: &str) -> Result<super::ExternalBtreeIndex> {
     let manifest = read_manifest(&object_store, &index_dir).await?;
 
     let cache = Arc::new(LanceCache::no_cache());
-    let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
-        object_store,
-        index_dir,
-        cache.clone(),
-    ));
+    let store: Arc<dyn IndexStore> =
+        Arc::new(LanceIndexStore::new(object_store, index_dir, cache.clone()));
 
     // The BTree plugin ignores index_details on load, so a default `Any` is fine.
     let index = BTreeIndexPlugin

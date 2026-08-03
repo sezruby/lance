@@ -31,9 +31,12 @@
 //! The rerank sidecar is handled separately (each executor writes its shard at the
 //! correct global byte offset), tracked with the index shards.
 
-use arrow_array::RecordBatch;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use arrow_schema::SchemaRef;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::pb::Ivf as PbIvf;
 use lance_index::pb::Pq as PbPq;
@@ -129,7 +132,7 @@ impl BroadcastPayload {
         let ivf = IvfModel::try_from(ivf_pb)?;
         let pq_pb = PbPq::decode(self.pq_pb.as_slice())
             .map_err(|e| Error::index(format!("decode PbPq: {e}")))?;
-        let pq = ProductQuantizer::from_proto(&pq_pb, self.metric.into())?;
+        let pq = ProductQuantizer::from_proto(&pq_pb, self.metric)?;
         Ok((ivf, pq))
     }
 }
@@ -144,19 +147,49 @@ pub async fn train_broadcast_payload(
 ) -> Result<BroadcastPayload> {
     let source = ParquetVectorSource::try_new(files, vector_column).await?;
     let (ivf, pq, training) = super::build::train_quantizers(&source, params).await?;
-    let ivf_pb = PbIvf::try_from(&ivf)?.encode_to_vec();
-    let pq_pb = PbPq::try_from(&pq)?.encode_to_vec();
+    payload_from_models(&ivf, &pq, &training, params)
+}
+
+/// Driver phase 1, distributed-READ variant: train IVF centroids + PQ from a `training`
+/// sample the executors already read (each ran [`sample_shard`] over its file shard and
+/// shipped the FSL back; the driver concatenated the chunks). Identical to
+/// [`train_broadcast_payload`] except the ~`num_partitions * sample_rate`-row sample
+/// read — the dominant single-driver-node I/O cost — is done in parallel across the
+/// cluster instead of serially on the driver. The kmeans/PQ compute stays fully native
+/// on the driver (NO Lloyd barriers, NO per-iteration broadcast). Reuses the shared
+/// [`super::build::train_quantizers_from_sample`], so it emits the same payload bytes
+/// [`train_broadcast_payload`] would for the same sample.
+pub fn train_broadcast_payload_from_sample(
+    training: arrow_array::FixedSizeListArray,
+    params: &ExternalIvfPqIndexParams,
+) -> Result<BroadcastPayload> {
+    let (ivf, pq, training) = super::build::train_quantizers_from_sample(training, params)?;
+    payload_from_models(&ivf, &pq, &training, params)
+}
+
+/// Serialize trained `(ivf, pq)` plus SQ8 bounds (learned from `training`) into a
+/// broadcast-ready [`BroadcastPayload`]. Shared by the single-box driver train
+/// ([`train_broadcast_payload`]) and the distributed-training assembly
+/// ([`assemble_broadcast_payload_from_centroids`]) so both emit identical payload
+/// bytes for the same models.
+fn payload_from_models(
+    ivf: &IvfModel,
+    pq: &ProductQuantizer,
+    training: &arrow_array::FixedSizeListArray,
+    params: &ExternalIvfPqIndexParams,
+) -> Result<BroadcastPayload> {
+    let ivf_pb = PbIvf::try_from(ivf)?.encode_to_vec();
+    let pq_pb = PbPq::try_from(pq)?.encode_to_vec();
 
     // Learn SQ8 bounds from the same training sample so executors encode their
     // sidecar shards in one shared code space. Only meaningful for a rerank store;
     // (0,0) otherwise (unused). Mirrors the driver-side build_index bounds step.
-    let (sq_bounds_min, sq_bounds_max) = if params.rerank_store
-        != super::params::RerankStore::None
+    let (sq_bounds_min, sq_bounds_max) = if params.rerank_store != super::params::RerankStore::None
     {
         use lance_index::vector::sq::ScalarQuantizer;
         let dim = training.value_length() as usize;
         let mut sq = ScalarQuantizer::new(8, dim);
-        sq.update_bounds::<arrow::datatypes::Float32Type>(&training)?;
+        sq.update_bounds::<arrow::datatypes::Float32Type>(training)?;
         let b = sq.bounds();
         (b.start, b.end)
     } else {
@@ -170,6 +203,259 @@ pub async fn train_broadcast_payload(
         sq_bounds_min,
         sq_bounds_max,
     })
+}
+
+/// Distributed-training sampling step: draw a `sample_size`-row training sample from
+/// this shard's `files`. Runs on an executor over its own file shard (same sharding
+/// as [`build_shard_to_parquet`]), so the sample I/O is distributed and each shard's
+/// sample stays local as one RDD partition for the [`compute_partial_stats_in_memory`]
+/// E-step. The union of the per-shard samples is the training set; the driver collects
+/// it once for PQ ([`assemble_broadcast_payload_from_centroids`]) and initial-centroid
+/// selection. Uses the same deterministic range-spread [`ParquetVectorSource::sample`]
+/// the single-box build uses, so a 1-shard run reproduces the single-box sample exactly.
+pub async fn sample_shard(
+    files: Vec<ParquetFileSpec>,
+    vector_column: &str,
+    sample_size: usize,
+) -> Result<arrow_array::FixedSizeListArray> {
+    let source = ParquetVectorSource::try_new(files, vector_column).await?;
+    source.sample(sample_size).await
+}
+
+/// Distributed-READ sampling step: draw a `sample_size`-row training sample from this
+/// shard's `files` and WRITE it to `out_uri` as a compact single-column parquet
+/// (`vector_column`: `FixedSizeList<Float32>`); returns the number of rows written.
+///
+/// Unlike [`sample_shard`], which ships the sample back as Arrow-IPC bytes for the
+/// driver to `collect()` onto the JVM heap (multi-GiB at `num_partitions * sample_rate`
+/// rows / dim=1024), this keeps the sample OFF the JVM heap end to end: each executor
+/// materializes its shard's compact parquet on shared storage, and the driver trains
+/// over the union of those files via the ordinary [`train_broadcast_payload`] — the same
+/// native, off-heap read the single-box driver train uses, only fed pre-sampled files so
+/// the ~1000-file random-access scan happened in parallel across the cluster. The
+/// driver's [`ParquetVectorSource`] coerces the column back to an FSL regardless of the
+/// child-field name parquet round-trips it to, so the written schema need not match the
+/// corpus's exactly.
+pub async fn sample_shard_to_parquet(
+    files: Vec<ParquetFileSpec>,
+    vector_column: &str,
+    sample_size: usize,
+    out_uri: &str,
+) -> Result<u64> {
+    use parquet::arrow::AsyncArrowWriter;
+    let fsl = sample_shard(files, vector_column, sample_size).await?;
+    let rows = fsl.len() as u64;
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        vector_column,
+        fsl.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![std::sync::Arc::new(fsl)])?;
+    let (object_store, path) = ObjectStore::from_uri(out_uri).await?;
+    let writer = object_store.create(&path).await?;
+    let mut aw = AsyncArrowWriter::try_new(WriterAdapter(writer), schema, None)
+        .map_err(|e| Error::io(format!("sample shard writer create {out_uri}: {e}")))?;
+    aw.write(&batch)
+        .await
+        .map_err(|e| Error::io(format!("sample shard write {out_uri}: {e}")))?;
+    aw.close()
+        .await
+        .map_err(|e| Error::io(format!("sample shard close {out_uri}: {e}")))?;
+    Ok(rows)
+}
+
+/// Distributed-training driver step: given IVF `centroids` trained across the
+/// cluster (via the [`lance_index::vector::kmeans::distributed`] partial-aggregate
+/// Lloyd loop the Spark orchestration drives) and the collected training `sample`,
+/// train the PQ codebook and assemble the same [`BroadcastPayload`] the single-box
+/// [`train_broadcast_payload`] produces. This replaces only the IVF `KMeans::new`
+/// compute — the dominant driver cost at 4096 centroids × d1024 — with distributed
+/// centroids; PQ still trains on the driver from the (fixed-size ~`num_partitions *
+/// sample_rate`) sample. Pure compute, no I/O.
+pub fn assemble_broadcast_payload_from_centroids(
+    sample: &arrow_array::FixedSizeListArray,
+    centroids: arrow_array::FixedSizeListArray,
+    params: &ExternalIvfPqIndexParams,
+) -> Result<BroadcastPayload> {
+    let (ivf, pq) = super::build::build_pq_from_centroids(sample, centroids, params)?;
+    payload_from_models(&ivf, &pq, sample, params)
+}
+
+/// Distributed-training executor E-step for the external index: assign this shard's
+/// cached training `data` to the broadcast `centroids` and return the per-cluster
+/// partial stats as the wire [`RecordBatch`]. Pure compute (no Dataset, no I/O), so
+/// it runs inside a Spark `mapPartitions` over the cached sample RDD. The core
+/// assignment is [`lance_index::vector::kmeans::distributed::compute_partial_stats`],
+/// which runs Cosine as L2 and expects both sides unit-normalized; `centroids`
+/// arrive normalized (from `select_initial_centroids` / `finalize_centroids`), so we
+/// only normalize `data` here for Cosine.
+pub fn compute_partial_stats_in_memory(
+    centroids: &arrow_array::FixedSizeListArray,
+    data: &arrow_array::FixedSizeListArray,
+    metric: MetricType,
+) -> Result<RecordBatch> {
+    use lance_index::vector::kmeans::distributed as dk;
+    let normalized;
+    let data_ref = if matches!(metric, MetricType::Cosine) {
+        normalized = lance_linalg::kernels::normalize_fsl(data)?;
+        &normalized
+    } else {
+        data
+    };
+    let stats = dk::compute_partial_stats(centroids, data_ref, metric)?;
+    Ok(stats.into_record_batch())
+}
+
+// ---- resident-sample registry (fully off-JVM distributed training) ----------
+//
+// Keep each shard's training sample resident in native memory across Lloyd
+// iterations, keyed by `(session_id, shard_id)`. The orchestration layer (Spark
+// today, a Ray actor later) ships only ids + file paths + centroid bytes, so the
+// sample vectors are read once and never re-cross the language boundary — the
+// per-iteration JVM<->native copy and Spark shuffle of the sample disappear.
+//
+// The registry is process-global (one per executor/driver process), keyed by a
+// caller-chosen `session_id` so concurrent trainings on one process don't collide.
+// Load-on-miss keeps every entry recompute-safe: a shard that lands on a fresh
+// executor (or a lost Spark partition) simply re-reads its parquet. Free a run's
+// entries with [`free_resident_samples`].
+
+/// Reserved `shard_id` for the driver's concatenated training sample (init + PQ).
+const DRIVER_SHARD_ID: i32 = -1;
+
+type ResidentKey = (i64, i32);
+
+fn resident_registry() -> &'static Mutex<HashMap<ResidentKey, Arc<FixedSizeListArray>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<ResidentKey, Arc<FixedSizeListArray>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resident_get(key: ResidentKey) -> Option<Arc<FixedSizeListArray>> {
+    resident_registry().lock().unwrap().get(&key).cloned()
+}
+
+fn resident_put(key: ResidentKey, fsl: FixedSizeListArray) -> Arc<FixedSizeListArray> {
+    resident_registry()
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_insert_with(|| Arc::new(fsl))
+        .clone()
+}
+
+/// Wrap a single-column FSL as a `RecordBatch` so the driver-side kmeans helpers
+/// (which take `Vec<RecordBatch>`) can consume the resident sample directly.
+fn fsl_to_single_col_batch(fsl: &FixedSizeListArray) -> Result<RecordBatch> {
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "vec",
+        fsl.data_type().clone(),
+        false,
+    )]));
+    Ok(RecordBatch::try_new(schema, vec![Arc::new(fsl.clone())])?)
+}
+
+/// Executor E-step (off-JVM): assign this shard's *resident* training sample to
+/// `centroids` and return the per-cluster `PartialStats` batch. The first call for
+/// `(session_id, shard_id)` reads the sample from `files` and caches it; every later
+/// Lloyd iteration reuses the resident copy, so the vectors never re-cross JNI.
+/// Semantically identical to [`compute_partial_stats_in_memory`] on that sample.
+#[allow(clippy::too_many_arguments)]
+pub async fn compute_partial_stats_resident(
+    session_id: i64,
+    shard_id: i32,
+    files: Vec<ParquetFileSpec>,
+    vector_column: &str,
+    sample_size: usize,
+    centroids: &FixedSizeListArray,
+    metric: MetricType,
+) -> Result<RecordBatch> {
+    let key = (session_id, shard_id);
+    let sample = match resident_get(key) {
+        Some(s) => s,
+        None => {
+            let fsl = sample_shard(files, vector_column, sample_size).await?;
+            resident_put(key, fsl)
+        }
+    };
+    compute_partial_stats_in_memory(centroids, &sample, metric)
+}
+
+/// Driver setup (off-JVM): read every shard's training sample once, concatenate into
+/// one resident FSL keyed `(session_id, DRIVER_SHARD_ID)`, and return its row count.
+/// Feeds [`select_initial_centroids_resident`] (init) and [`assemble_payload_resident`]
+/// (PQ) without ever materializing the (fixed-size ~`num_partitions * sample_rate`)
+/// sample in JVM heap. Shards are read with bounded concurrency, mirroring the
+/// single-box buffered sample read.
+pub async fn load_driver_sample(
+    session_id: i64,
+    file_groups: Vec<Vec<ParquetFileSpec>>,
+    vector_column: &str,
+    per_shard_sample: usize,
+) -> Result<usize> {
+    use futures::stream::{self, StreamExt};
+    let samples: Vec<FixedSizeListArray> = stream::iter(file_groups.into_iter())
+        .map(|files| {
+            let vc = vector_column.to_string();
+            async move { sample_shard(files, &vc, per_shard_sample).await }
+        })
+        .buffered(16)
+        .try_collect()
+        .await?;
+    if samples.is_empty() {
+        return Err(Error::invalid_input(
+            "load_driver_sample: no shards to sample",
+        ));
+    }
+    let arrays: Vec<&dyn Array> = samples.iter().map(|s| s as &dyn Array).collect();
+    let combined = arrow::compute::concat(&arrays)?;
+    let fsl = combined
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .cloned()
+        .ok_or_else(|| Error::invalid_input("driver sample concat produced non-FSL"))?;
+    let n = fsl.len();
+    resident_put((session_id, DRIVER_SHARD_ID), fsl);
+    Ok(n)
+}
+
+/// Driver init (off-JVM): pick `k` initial centroids from the resident driver sample
+/// loaded by [`load_driver_sample`]. Same selection as the `byte[][]`-based
+/// [`lance_index::vector::kmeans::distributed::select_initial_centroids`], only the
+/// sample is read from native memory instead of collected chunks.
+pub fn select_initial_centroids_resident(
+    session_id: i64,
+    k: usize,
+    seed: u64,
+) -> Result<FixedSizeListArray> {
+    let sample = resident_get((session_id, DRIVER_SHARD_ID)).ok_or_else(|| {
+        Error::invalid_input("select_initial_centroids_resident: call load_driver_sample first")
+    })?;
+    let batch = fsl_to_single_col_batch(&sample)?;
+    lance_index::vector::kmeans::distributed::select_initial_centroids(vec![batch], k, seed)
+}
+
+/// Driver assembly (off-JVM): train the PQ codebook on the resident driver sample
+/// (from [`load_driver_sample`]) using the converged `centroids`, and return the same
+/// [`BroadcastPayload`] the collected-chunk path produces.
+pub fn assemble_payload_resident(
+    session_id: i64,
+    centroids: FixedSizeListArray,
+    params: &ExternalIvfPqIndexParams,
+) -> Result<BroadcastPayload> {
+    let sample = resident_get((session_id, DRIVER_SHARD_ID)).ok_or_else(|| {
+        Error::invalid_input("assemble_payload_resident: call load_driver_sample first")
+    })?;
+    assemble_broadcast_payload_from_centroids(sample.as_ref(), centroids, params)
+}
+
+/// Drop every resident sample for `session_id` (driver + executor). Returns the number
+/// of entries freed. Call from the orchestration `finally` once training converges.
+pub fn free_resident_samples(session_id: i64) -> usize {
+    let mut guard = resident_registry().lock().unwrap();
+    let before = guard.len();
+    guard.retain(|(s, _), _| *s != session_id);
+    before - guard.len()
 }
 
 /// Executor phase 2: assign + PQ-encode this shard's `files` (whose global index
@@ -203,9 +489,7 @@ pub async fn build_shard_to_parquet(
                     super::rerank::RerankKind::Sq8,
                     payload.sq_bounds_min..payload.sq_bounds_max,
                 ),
-                super::params::RerankStore::Flat => {
-                    (super::rerank::RerankKind::Flat, 0.0..0.0)
-                }
+                super::params::RerankStore::Flat => (super::rerank::RerankKind::Flat, 0.0..0.0),
                 super::params::RerankStore::None => unreachable!(),
             };
             if matches!(params.metric, MetricType::Dot) {
@@ -278,10 +562,32 @@ pub async fn merge_shards(
 ) -> Result<()> {
     let (ivf, pq) = payload.decode()?;
 
-    let mut all_groups: Vec<Vec<RecordBatch>> = Vec::new();
-    for uri in shard_uris {
-        all_groups.extend(read_shard_parquet(uri).await?);
-    }
+    // Read the shard parquets concurrently, then hand the writer in-memory streams.
+    //
+    // This shape is deliberate — it is NOT worth converting to lazy per-shard parquet streams.
+    // `write_pq_partitions` seeds its merge heap by peeking the FIRST batch of every stream in a
+    // serial loop, and `merge_streams` then advances exactly one stream at a time. With lazy
+    // readers that makes the whole merge object-store-serial: at `filesPerTask=1` there is one
+    // shard parquet per source file (~1000 for a 10M-row corpus), so serial reads cost ~1000
+    // round-trips — this is the stall that dominates the merge phase. Reading all shards up front
+    // with bounded concurrency and feeding the writer already-materialized batches keeps the
+    // writer's serial seed/merge purely in-memory. Memory is not the constraint: the shard rows
+    // carry only PQ codes + rids + part_id (~`num_sub_vectors` + 12 B/row, e.g. ~28 B at m=16), so
+    // even a 40M-row corpus is ~1 GiB on the driver — the multi-GiB vectors live in the sidecar,
+    // which is referenced by URI in the manifest and never read here.
+    //
+    // Read order is irrelevant: `write_pq_partitions` heap-orders the groups by `__ivf_part_id`,
+    // and `read_shard_parquet` already returns one single-part_id batch-vec per group.
+    //
+    // Concurrency is sized for the ~1000-shard case; small PQ-code files make 32 concurrent reads
+    // cheap on the driver and cut the round-trip waves 2x over a 16-wide fan.
+    const MERGE_READ_CONCURRENCY: usize = 32;
+    let per_shard: Vec<Vec<Vec<RecordBatch>>> =
+        futures::stream::iter(shard_uris.iter().map(|uri| read_shard_parquet(uri)))
+            .buffer_unordered(MERGE_READ_CONCURRENCY)
+            .try_collect()
+            .await?;
+    let all_groups: Vec<Vec<RecordBatch>> = per_shard.into_iter().flatten().collect();
     let streams: Vec<_> = all_groups
         .into_iter()
         .filter(|g| !g.is_empty())
@@ -323,7 +629,7 @@ pub async fn merge_shards_to_index(
     sidecar_shards: &[(String, u64)],
 ) -> Result<()> {
     let (object_store, index_dir) = ObjectStore::from_uri(index_dir_uri).await?;
-    let index_path = index_dir.child(super::open::INDEX_FILE_NAME);
+    let index_path = index_dir.clone().join(super::open::INDEX_FILE_NAME);
     merge_shards(
         payload,
         shard_uris,
@@ -337,11 +643,28 @@ pub async fn merge_shards_to_index(
     // from each file's footer (the rerank sidecar's global-ordinal layout and the
     // rid file_id mapping both depend on authoritative counts).
     let mut specs: Vec<ParquetFileSpec> = file_paths.iter().map(ParquetFileSpec::of).collect();
-    for spec in specs.iter_mut() {
-        if spec.num_rows == 0 {
-            let b = super::parquet_source::open_parquet_async(&spec.file_path).await?;
-            spec.num_rows = b.metadata().file_metadata().num_rows() as u64;
-        }
+    // Resolve each missing `num_rows` from its parquet footer concurrently. These are
+    // independent footer reads; serializing them over the full source-file list (~1000 files)
+    // re-introduces the object-store round-trip stall on the driver. Results are keyed back by
+    // index so the `file_id → path` order (array position) is preserved. Sized like the shard
+    // read — footer-only reads are tiny, so 32-wide keeps the round-trip waves short.
+    const FOOTER_READ_CONCURRENCY: usize = 32;
+    let missing: Vec<(usize, String)> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.num_rows == 0)
+        .map(|(i, s)| (i, s.file_path.clone()))
+        .collect();
+    let counts: Vec<(usize, u64)> =
+        futures::stream::iter(missing.into_iter().map(|(i, path)| async move {
+            let b = super::parquet_source::open_parquet_async(&path).await?;
+            Ok::<(usize, u64), Error>((i, b.metadata().file_metadata().num_rows() as u64))
+        }))
+        .buffer_unordered(FOOTER_READ_CONCURRENCY)
+        .try_collect()
+        .await?;
+    for (i, n) in counts {
+        specs[i].num_rows = n;
     }
 
     // Assemble the rerank meta from the sidecar shards, if any. Prefix-sum the
@@ -623,8 +946,8 @@ mod tests {
             .await
             .unwrap();
         let dist_uuid = uuid::Uuid::new_v4();
-        let dist_dir = root.child(dist_uuid.to_string());
-        let dist_index = dist_dir.child(super::super::open::INDEX_FILE_NAME);
+        let dist_dir = root.join(dist_uuid.to_string());
+        let dist_index = dist_dir.clone().join(super::super::open::INDEX_FILE_NAME);
         merge_shards(&payload, &shard_uris, "vec", &dist_index, &os)
             .await
             .expect("merge");
@@ -660,8 +983,8 @@ mod tests {
             .await
             .unwrap();
         let ref_uuid = uuid::Uuid::new_v4();
-        let ref_dir = rroot.child(ref_uuid.to_string());
-        let ref_index = ref_dir.child(super::super::open::INDEX_FILE_NAME);
+        let ref_dir = rroot.join(ref_uuid.to_string());
+        let ref_index = ref_dir.clone().join(super::super::open::INDEX_FILE_NAME);
         let ref_streams: Vec<_> = ref_groups
             .into_iter()
             .filter(|g| !g.is_empty())
@@ -808,8 +1131,8 @@ mod tests {
                 .await
                 .unwrap();
             let uuid = uuid::Uuid::new_v4();
-            let dir = root.child(uuid.to_string());
-            let index_path = dir.child(super::super::open::INDEX_FILE_NAME);
+            let dir = root.join(uuid.to_string());
+            let index_path = dir.clone().join(super::super::open::INDEX_FILE_NAME);
             let streams: Vec<_> = groups
                 .into_iter()
                 .filter(|g| !g.is_empty())
@@ -957,15 +1280,15 @@ mod tests {
         let (os_b2, root_b2) = ObjectStore::from_uri(out_b2.path().to_str().unwrap())
             .await
             .unwrap();
-        let dir_b2 = root_b2.child(uuid_b.to_string());
+        let dir_b2 = root_b2.join(uuid_b.to_string());
         // Copy index.idx bytes B → B2.
         let idx_bytes = os_b
-            .read_one_all(&dir_b.child(super::super::open::INDEX_FILE_NAME))
+            .read_one_all(&dir_b.join(super::super::open::INDEX_FILE_NAME))
             .await
             .unwrap();
         os_b2
             .put(
-                &dir_b2.child(super::super::open::INDEX_FILE_NAME),
+                &dir_b2.clone().join(super::super::open::INDEX_FILE_NAME),
                 &idx_bytes,
             )
             .await
@@ -1014,5 +1337,235 @@ mod tests {
                 assert!((a.distance - b.distance).abs() < 1e-4, "distance differs");
             }
         }
+    }
+
+    /// Exact top-k over a corpus by global row index (brute force, L2).
+    fn brute_force_topk(vectors: &FixedSizeListArray, query: &[f32], k: usize) -> Vec<usize> {
+        let values = vectors
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let dim = vectors.value_length() as usize;
+        let mut dists: Vec<(usize, f32)> = (0..vectors.len())
+            .map(|i| {
+                let s = (0..dim)
+                    .map(|d| {
+                        let diff = values.value(i * dim + d) - query[d];
+                        diff * diff
+                    })
+                    .sum();
+                (i, s)
+            })
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        dists.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+
+    /// End-to-end recall for the DISTRIBUTED-TRAINING path: sample each shard,
+    /// drive the partial-aggregate Lloyd loop with the distributed primitives
+    /// (`select_initial_centroids` → `compute_partial_stats_in_memory` →
+    /// `reduce_partial_stats` → `finalize_centroids`) exactly as the Spark
+    /// orchestration does, assemble the broadcast payload from the distributed
+    /// centroids, then build + merge shards and open. Asserts search recall clears
+    /// lance's ≥0.5 bar against brute-force ground truth — proof that distributing
+    /// the IVF *training* (not just the shard encode/merge, which
+    /// `merge_from_persisted_shards_matches` covers) still yields a usable index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_training_recall_above_threshold() {
+        use arrow_array::ArrayRef;
+        use lance_index::vector::kmeans::distributed as dk;
+
+        const DIM: usize = 8;
+        const K: usize = 10;
+        const NUM_FILES: usize = 4;
+        const PER_FILE: usize = 512;
+        const NUM_PARTITIONS: usize = 8;
+
+        let data = TempDir::new().unwrap();
+        let file_paths: Vec<String> = (0..NUM_FILES)
+            .map(|i| {
+                let p = data.path().join(format!("f{i}.parquet"));
+                write_parquet(&p, PER_FILE, DIM, 700 + i as u64);
+                p.to_str().unwrap().to_string()
+            })
+            .collect();
+        let files: Vec<ParquetFileSpec> = file_paths.iter().map(ParquetFileSpec::of).collect();
+
+        // Read all vectors back, concatenated in file order, for ground truth. A
+        // global index is `file_position * PER_FILE + local_row`.
+        let all_vectors = {
+            let mut owned: Vec<FixedSizeListArray> = Vec::new();
+            for p in &file_paths {
+                let file = std::fs::File::open(p).unwrap();
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .unwrap()
+                        .build()
+                        .unwrap();
+                for r in reader {
+                    owned.push(
+                        r.unwrap()
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<FixedSizeListArray>()
+                            .unwrap()
+                            .clone(),
+                    );
+                }
+            }
+            let refs: Vec<&dyn Array> = owned.iter().map(|a| a as &dyn Array).collect();
+            arrow::compute::concat(&refs)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap()
+                .clone()
+        };
+
+        let params = ExternalIvfPqIndexParams::builder()
+            .num_partitions(NUM_PARTITIONS)
+            .num_sub_vectors(4)
+            .num_bits_per_sub_vector(8)
+            .metric(MetricType::L2)
+            .max_iters(15)
+            .sample_rate(64)
+            .build();
+
+        // --- Distributed training: one cached sample chunk per file/shard. ---
+        let per_shard_sample = (NUM_PARTITIONS * params.sample_rate)
+            .div_ceil(NUM_FILES)
+            .max(1);
+        let mut shard_samples: Vec<FixedSizeListArray> = Vec::with_capacity(NUM_FILES);
+        for f in &files {
+            shard_samples.push(
+                sample_shard(vec![f.clone()], "vec", per_shard_sample)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Wrap each shard sample as a single-column "vec" batch for init, and concat
+        // the union for PQ training (the driver holds the whole sample either way).
+        let sample_schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            shard_samples[0].data_type().clone(),
+            false,
+        )]));
+        let sample_batches: Vec<RecordBatch> = shard_samples
+            .iter()
+            .map(|s| {
+                RecordBatch::try_new(sample_schema.clone(), vec![Arc::new(s.clone()) as ArrayRef])
+                    .unwrap()
+            })
+            .collect();
+        let full_sample = {
+            let refs: Vec<&dyn Array> = shard_samples.iter().map(|s| s as &dyn Array).collect();
+            arrow::compute::concat(&refs)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap()
+                .clone()
+        };
+
+        // Partial-aggregate Lloyd loop over the distributed primitives.
+        let mut centroids =
+            dk::select_initial_centroids(sample_batches, NUM_PARTITIONS, params.seed).unwrap();
+        for _ in 0..params.max_iters {
+            let reduced = dk::reduce_partial_stats(shard_samples.iter().map(|s| {
+                let rb = compute_partial_stats_in_memory(&centroids, s, params.metric).unwrap();
+                dk::PartialStats::from_record_batch(rb).unwrap()
+            }))
+            .unwrap();
+            centroids = dk::finalize_centroids(&reduced, &centroids).unwrap();
+        }
+        let payload =
+            assemble_broadcast_payload_from_centroids(&full_sample, centroids, &params).unwrap();
+
+        // --- Phase 2/3: build shards from the payload, merge to an openable index. ---
+        let shard_dir = TempDir::new().unwrap();
+        let mut shard_uris = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            let uri = shard_dir
+                .path()
+                .join(format!("shard{i}.parquet"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            build_shard_to_parquet(&payload, vec![f.clone()], "vec", i as u32, &params, &uri)
+                .await
+                .unwrap();
+            shard_uris.push(uri);
+        }
+        let out = TempDir::new().unwrap();
+        let index_dir = out.path().join(uuid::Uuid::new_v4().to_string());
+        let index_dir_uri = index_dir.to_str().unwrap();
+        merge_shards_to_index(
+            &payload,
+            &shard_uris,
+            &file_paths,
+            "vec",
+            index_dir_uri,
+            &params,
+            &[],
+        )
+        .await
+        .unwrap();
+        let idx = ExternalIvfPqIndex::open(index_dir_uri).await.expect("open");
+
+        // Map a returned file path to its global row base (position * PER_FILE),
+        // keyed on basename to be robust to any path normalization.
+        let base_of: std::collections::HashMap<String, u64> = file_paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let name = std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                (name, (i * PER_FILE) as u64)
+            })
+            .collect();
+
+        // --- Recall vs brute-force ground truth (lance ≥0.5 bar). ---
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(123);
+        let mut hits = 0;
+        let total_queries = 20;
+        for _ in 0..total_queries {
+            let query: Vec<f32> = (0..DIM).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let truth: std::collections::HashSet<usize> = brute_force_topk(&all_vectors, &query, K)
+                .into_iter()
+                .collect();
+
+            let results = idx
+                .search(
+                    &query, K, /* nprobes = */ 4, /* refine_factor = */ 4, None,
+                )
+                .await
+                .expect("search");
+            assert!(!results.is_empty(), "search returned empty");
+            let got: std::collections::HashSet<usize> = results
+                .iter()
+                .map(|r| {
+                    let name = std::path::Path::new(&r.file_path)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap();
+                    (base_of[name] + r.row_index) as usize
+                })
+                .collect();
+            if got.intersection(&truth).count() >= K / 2 {
+                hits += 1;
+            }
+        }
+        assert!(
+            hits >= total_queries / 2,
+            "distributed-training recall too low: {hits}/{total_queries} queries had ≥ K/2 correct"
+        );
     }
 }

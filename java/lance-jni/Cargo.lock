@@ -3939,6 +3939,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "tempfile",
  "tokio",

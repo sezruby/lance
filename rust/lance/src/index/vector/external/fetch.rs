@@ -64,7 +64,7 @@ pub async fn fetch_rows(
 /// own manifest type. `is_registered` validates that a fetched path belongs to the
 /// index's registered file set; `first_file_path` supplies the schema source for
 /// the empty-input case.
-pub(crate) async fn fetch_rows_impl(
+pub async fn fetch_rows_impl(
     parquet_meta_cache: &ParquetMetaCache,
     is_registered: impl Fn(&str) -> bool,
     first_file_path: &str,
@@ -112,13 +112,8 @@ pub(crate) async fn fetch_rows_impl(
     let mut shared_schema: Option<SchemaRef> = None;
     for (file_path, hits) in by_file {
         let row_indices: Vec<u64> = hits.iter().map(|(_, r)| *r).collect();
-        let batch = read_rows_from_file(
-            parquet_meta_cache,
-            &file_path,
-            projection,
-            &row_indices,
-        )
-        .await?;
+        let batch =
+            read_rows_from_file(parquet_meta_cache, &file_path, projection, &row_indices).await?;
         if shared_schema.is_none() {
             shared_schema = Some(batch.schema());
         }
@@ -160,8 +155,8 @@ pub(crate) async fn fetch_rows_impl(
     }
 
     // Slice each input row's columns into the collectors.
-    for input_pos in 0..total_rows {
-        let (batch_idx, row_in_batch) = by_input_position[input_pos].ok_or_else(|| {
+    for (input_pos, entry) in by_input_position.iter().enumerate() {
+        let (batch_idx, row_in_batch) = entry.ok_or_else(|| {
             Error::index(format!("fetch_rows: input position {input_pos} unmapped"))
         })?;
         let batch = &per_file_results[batch_idx].1;
@@ -200,12 +195,12 @@ async fn read_rows_from_file(
     let mut sorted: Vec<u64> = row_indices.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    if let Some(&last) = sorted.last() {
-        if last >= total_rows {
-            return Err(Error::invalid_input(format!(
-                "fetch_rows: row_index {last} out of range for {path} ({total_rows} rows)"
-            )));
-        }
+    if let Some(&last) = sorted.last()
+        && last >= total_rows
+    {
+        return Err(Error::invalid_input(format!(
+            "fetch_rows: row_index {last} out of range for {path} ({total_rows} rows)"
+        )));
     }
     let ranges: Vec<Range<usize>> = sorted
         .iter()

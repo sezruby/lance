@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow::compute::concat;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt64Array, UInt8Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt8Array, UInt64Array};
 use futures::TryStreamExt;
 use lance_core::{Error, Result};
 use lance_index::vector::pq::ProductQuantizer;
@@ -169,11 +169,11 @@ pub async fn search_batch(
                 let dist = dist_values[i];
                 if top_heap.len() < candidate_count {
                     top_heap.push((OrderedF32(dist), rid));
-                } else if let Some(top) = top_heap.peek() {
-                    if dist < top.0.0 {
-                        top_heap.pop();
-                        top_heap.push((OrderedF32(dist), rid));
-                    }
+                } else if let Some(top) = top_heap.peek()
+                    && dist < top.0.0
+                {
+                    top_heap.pop();
+                    top_heap.push((OrderedF32(dist), rid));
                 }
             }
         }
@@ -194,10 +194,10 @@ pub async fn search_batch(
                     ))
                 })?
                 .to_string();
-            if let Some(f) = filter {
-                if !f.keep(&file_path, row_in_file) {
-                    continue;
-                }
+            if let Some(f) = filter
+                && !f.keep(&file_path, row_in_file)
+            {
+                continue;
             }
             to_refine.push((file_id, row_in_file, file_path));
         }
@@ -338,9 +338,8 @@ pub async fn search_batch(
                     .downcast_ref::<Float32Array>()
                     .expect("Float32Array vectors");
                 let mut dist = 0.0f32;
-                for d in 0..dim {
+                for (d, q) in query.iter().enumerate() {
                     let v = values.value(pos * dim + d);
-                    let q = query[d];
                     let diff = v - q;
                     dist += diff * diff;
                 }
@@ -412,13 +411,13 @@ pub async fn search_flat(
         .iter()
         .map(|e| ParquetFileSpec::of(e.file_path.clone()))
         .collect();
-    let source =
-        ParquetVectorSource::try_new(specs, &opened.manifest.vector_column).await?;
+    let source = ParquetVectorSource::try_new(specs, &opened.manifest.vector_column).await?;
 
     // Per query: a max-heap of (distance, rid) capped at k (largest distance on top, so we
     // pop the worst when a closer row arrives).
-    let mut heaps: Vec<BinaryHeap<(OrderedF32, u64)>> =
-        (0..queries.len()).map(|_| BinaryHeap::with_capacity(k + 1)).collect();
+    let mut heaps: Vec<BinaryHeap<(OrderedF32, u64)>> = (0..queries.len())
+        .map(|_| BinaryHeap::with_capacity(k + 1))
+        .collect();
 
     let mut stream = source.iter_batches().await?;
     let mut scanned: u64 = 0;
@@ -448,18 +447,18 @@ pub async fn search_flat(
             let rid = rid_col.value(row);
             for (qi, &query) in queries.iter().enumerate() {
                 let mut dist = 0.0f32;
-                for d in 0..dim {
-                    let diff = values.value(base + d) - query[d];
+                for (d, q) in query.iter().enumerate() {
+                    let diff = values.value(base + d) - q;
                     dist += diff * diff;
                 }
                 let heap = &mut heaps[qi];
                 if heap.len() < k {
                     heap.push((OrderedF32(dist), rid));
-                } else if let Some(top) = heap.peek() {
-                    if dist < top.0.0 {
-                        heap.pop();
-                        heap.push((OrderedF32(dist), rid));
-                    }
+                } else if let Some(top) = heap.peek()
+                    && dist < top.0.0
+                {
+                    heap.pop();
+                    heap.push((OrderedF32(dist), rid));
                 }
             }
         }
@@ -475,11 +474,7 @@ pub async fn search_flat(
                 .map(|(d, rid)| {
                     let file_id = (rid >> 32) as u32;
                     let row_in_file = rid & 0xFFFF_FFFF;
-                    let file_path = opened
-                        .manifest
-                        .file_path(file_id)
-                        .unwrap_or("")
-                        .to_string();
+                    let file_path = opened.manifest.file_path(file_id).unwrap_or("").to_string();
                     SearchResult {
                         file_path,
                         row_index: row_in_file,
@@ -580,15 +575,15 @@ async fn read_vectors_by_row_index(
     // FixedSizeList and List<Float32>.
     let dim_from_batch: usize = batches
         .iter()
-        .flat_map(|b| b.column_by_name(column).map(|c| c.clone()))
-        .find(|c| c.len() > 0)
+        .flat_map(|b| b.column_by_name(column).cloned())
+        .find(|c| !c.is_empty())
         .and_then(|col| {
             if let Some(fsl) = col.as_any().downcast_ref::<FixedSizeListArray>() {
                 Some(fsl.value_length() as usize)
-            } else if let Some(la) = col.as_any().downcast_ref::<arrow_array::ListArray>() {
-                Some(la.value_length(0) as usize)
             } else {
-                None
+                col.as_any()
+                    .downcast_ref::<arrow_array::ListArray>()
+                    .map(|la| la.value_length(0) as usize)
             }
         })
         .ok_or_else(|| {
@@ -647,7 +642,7 @@ async fn read_vectors_by_row_index(
 // snippet above pushes (OrderedF32(dist), rid) directly. Because BinaryHeap is a
 // max-heap, peek() returns the largest distance — exactly what we want as the
 // "weakest candidate to be kicked out when a better one arrives."
-#[derive(Copy, Clone, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, PartialEq)]
 struct OrderedF32(f32);
 impl Eq for OrderedF32 {}
 impl Ord for OrderedF32 {
@@ -655,6 +650,11 @@ impl Ord for OrderedF32 {
         self.0
             .partial_cmp(&other.0)
             .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+impl PartialOrd for OrderedF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 

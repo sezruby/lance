@@ -47,8 +47,12 @@ pub use types::{ParquetFileSpec, ParquetRowKey, RowFilter, SearchResult};
 // Distributed-build entry points (driver train + broadcast, executor shard build,
 // driver merge). Exposed for the JNI/Spark orchestration layer.
 pub use distributed::{
-    BroadcastPayload, ShardResult, SidecarShard, build_shard_to_parquet, merge_shards_to_index,
-    train_broadcast_payload,
+    BroadcastPayload, ShardResult, SidecarShard, assemble_broadcast_payload_from_centroids,
+    assemble_payload_resident, build_shard_to_parquet, compute_partial_stats_in_memory,
+    compute_partial_stats_resident, free_resident_samples, load_driver_sample,
+    merge_shards_to_index, sample_shard, sample_shard_to_parquet,
+    select_initial_centroids_resident, train_broadcast_payload,
+    train_broadcast_payload_from_sample,
 };
 
 use arrow_array::RecordBatch;
@@ -262,9 +266,8 @@ mod tests {
         let mut dists: Vec<(usize, f32)> = (0..n)
             .map(|i| {
                 let mut s = 0.0f32;
-                for d in 0..dim {
+                for (d, q) in query.iter().enumerate() {
                     let v = values.value(i * dim + d);
-                    let q = query[d];
                     let diff = v - q;
                     s += diff * diff;
                 }

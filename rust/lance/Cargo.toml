@@ -91,7 +91,7 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 # parquet is a runtime dep for the external vector index, which reads source
 # parquet files via page-index-aware random access (PageIndexPolicy::Required).
-parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "async", "object_store"] }
 
 [build-dependencies]
 prost-build.workspace = true

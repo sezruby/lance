@@ -47,10 +47,17 @@ use {
 use crate::vector::utils::SimpleIndex;
 use crate::{Error, Result};
 
+pub mod distributed;
+
 /// KMean initialization method.
 #[derive(Debug, PartialEq)]
 pub enum KMeanInit {
-    Random,
+    /// Random init. When the payload is `Some(seed)`, the seed is forwarded to
+    /// `kmeans_random_init` via `SmallRng::seed_from_u64(seed)` so the choice of
+    /// starting rows is reproducible; `None` falls back to `SmallRng::from_os_rng()`.
+    /// Set via [`KMeansParams::with_seed`]; the distributed `bootstrap_centroids`
+    /// primitive relies on it.
+    Random(Option<u64>),
     Incremental(Arc<FixedSizeListArray>),
 }
 
@@ -111,7 +118,7 @@ impl Default for KMeansParams {
             max_iters: 50,
             tolerance: 1e-4,
             redos: 1,
-            init: KMeanInit::Random,
+            init: KMeanInit::Random(None),
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
@@ -129,7 +136,7 @@ impl KMeansParams {
     ) -> Self {
         let init = match centroids {
             Some(centroids) => KMeanInit::Incremental(centroids),
-            None => KMeanInit::Random,
+            None => KMeanInit::Random(None),
         };
         Self {
             max_iters,
@@ -161,6 +168,27 @@ impl KMeansParams {
     /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
     pub fn with_hierarchical_k(mut self, hierarchical_k: usize) -> Self {
         self.hierarchical_k = hierarchical_k;
+        self
+    }
+
+    /// Set the distance type for kmeans clustering.
+    pub fn with_distance_type(mut self, distance_type: DistanceType) -> Self {
+        self.distance_type = distance_type;
+        self
+    }
+
+    /// Set a deterministic RNG seed for random initialization.
+    ///
+    /// The seed is stored as the payload of [`KMeanInit::Random`] and is only
+    /// consulted when the init mode is `Random`; calling this on a params
+    /// configured with `KMeanInit::Incremental` is a no-op because that mode
+    /// supplies centroids directly. Distributed kmeans relies on this so the
+    /// same `(samples, k, seed)` input produces the same bootstrap centroids
+    /// on every worker.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        if let KMeanInit::Random(slot) = &mut self.init {
+            *slot = Some(seed);
+        }
         self
     }
 }
@@ -609,6 +637,97 @@ impl KMeans {
         }
     }
 
+    /// Assign every row of `data` to its closest centroid, returning
+    /// `(membership, distances)` where entry `i` is the cluster id and squared
+    /// distance (unsquared for non-L2 metrics) of row `i`, or `None` when the
+    /// row could not be assigned. Used by distributed kmeans (Layer-1 E-step)
+    /// to accumulate per-cluster partial stats on a worker without pulling the
+    /// full corpus back to the driver.
+    #[allow(clippy::type_complexity)]
+    pub fn compute_membership_and_distances(
+        &self,
+        data: &FixedSizeListArray,
+    ) -> arrow::error::Result<(Vec<Option<u32>>, Vec<Option<f32>>)> {
+        if data.value_length() as usize != self.dimension {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: data dimension {} does not match centroid dimension {}",
+                data.value_length(),
+                self.dimension
+            )));
+        }
+
+        let index = SimpleIndex::may_train_index(
+            self.centroids.clone(),
+            self.dimension,
+            self.distance_type,
+        )
+        .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+        match (
+            data.value_type(),
+            self.centroids.data_type(),
+            self.distance_type,
+        ) {
+            (DataType::Float16, DataType::Float16, _) => {
+                let data_values = data.values().as_primitive::<Float16Type>().values();
+                let centroids = self.centroids.as_primitive::<Float16Type>().values();
+                Ok(KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            (DataType::Float32, DataType::Float32, _) => {
+                let data_values = data.values().as_primitive::<Float32Type>().values();
+                let centroids = self.centroids.as_primitive::<Float32Type>().values();
+                Ok(KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            (DataType::Float64, DataType::Float64, _) => {
+                let data_values = data.values().as_primitive::<Float64Type>().values();
+                let centroids = self.centroids.as_primitive::<Float64Type>().values();
+                Ok(KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            (DataType::UInt8, DataType::UInt8, DistanceType::Hamming) => {
+                let data_values = data.values().as_primitive::<UInt8Type>().values();
+                let centroids = self.centroids.as_primitive::<UInt8Type>().values();
+                Ok(KModeAlgo::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: can not compute membership for data type {} with centroid type {} and distance type {}",
+                data.value_type(),
+                self.centroids.data_type(),
+                self.distance_type
+            ))),
+        }
+    }
+
     /// Initialize a [`KMeans`] with random centroids.
     ///
     /// Parameters
@@ -671,11 +790,17 @@ impl KMeans {
         let mut cluster_sizes = vec![0; k];
         let mut adjusted_balance_factor = f32::MAX;
 
-        // TODO: use seed for Rng.
-        let rng = SmallRng::from_os_rng();
+        // A seeded `Random(Some(seed))` init makes the choice of starting rows
+        // reproducible (used by distributed `bootstrap_centroids`); otherwise
+        // seed from the OS. As before, every redo clones this same starting
+        // state, so `redos > 1` is only meaningful under `from_os_rng`.
+        let rng = match &params.init {
+            KMeanInit::Random(Some(seed)) => SmallRng::seed_from_u64(*seed),
+            _ => SmallRng::from_os_rng(),
+        };
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
-                KMeanInit::Random => Self::init_random::<T>(
+                KMeanInit::Random(_) => Self::init_random::<T>(
                     data.values(),
                     dimension,
                     k,

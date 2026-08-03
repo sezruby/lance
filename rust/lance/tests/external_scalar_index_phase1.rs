@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::print_stdout)]
+
 //! Phase 1 integration tests for the external scalar (BTree) index: drive only
 //! the public `ExternalBtreeIndex` API (build / open / search_keys / fetch_rows +
 //! RowFilter). Mirrors `external_index_phase1.rs` for the vector index.
@@ -113,8 +115,9 @@ async fn phase1_e2e_build_open_search_filter_fetch() {
         .iter()
         .map(|r| (file_id_of(&r.file_path), r.row_index))
         .collect();
-    let expected: HashSet<(usize, u64)> =
-        [(0usize, 5u64), (1, 0), (1, 50), (2, 50)].into_iter().collect();
+    let expected: HashSet<(usize, u64)> = [(0usize, 5u64), (1, 0), (1, 50), (2, 50)]
+        .into_iter()
+        .collect();
     assert_eq!(got, expected, "search_keys returned wrong (file, row) set");
     // distance is meaningless for a scalar lookup and is fixed at 0.0.
     assert!(results.iter().all(|r| r.distance == 0.0));

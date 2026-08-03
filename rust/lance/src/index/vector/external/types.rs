@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn predicate_row_filter_keeps_and_drops() {
-        let f = PredicateRowFilter(|_path: &str, row: u64| row % 2 == 0);
+        let f = PredicateRowFilter(|_path: &str, row: u64| row.is_multiple_of(2));
         assert!(f.keep("a.parquet", 0));
         assert!(!f.keep("a.parquet", 1));
         assert!(f.keep("b.parquet", 100));

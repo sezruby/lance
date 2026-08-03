@@ -42,7 +42,10 @@ pub struct ScalarExternalManifest {
 }
 
 impl ScalarExternalManifest {
-    pub fn from_build(key_column: &str, files: &[crate::index::scalar_external::ParquetFileSpec]) -> Self {
+    pub fn from_build(
+        key_column: &str,
+        files: &[crate::index::scalar_external::ParquetFileSpec],
+    ) -> Self {
         Self {
             manifest_version: 1,
             index_type: INDEX_TYPE_BTREE.to_string(),
@@ -91,7 +94,10 @@ pub async fn write_manifest(
 }
 
 /// Read `dir/manifest.json`.
-pub async fn read_manifest(object_store: &ObjectStore, dir: &Path) -> Result<ScalarExternalManifest> {
+pub async fn read_manifest(
+    object_store: &ObjectStore,
+    dir: &Path,
+) -> Result<ScalarExternalManifest> {
     let path = dir.clone().join(MANIFEST_FILE_NAME);
     let bytes = object_store
         .read_one_all(&path)
