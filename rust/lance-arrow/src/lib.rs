@@ -1017,40 +1017,25 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
-/// Helper function to normalize validity buffers
-/// Returns None for all-null validity (placeholder structs)
-fn normalize_validity(
-    validity: Option<&arrow_buffer::NullBuffer>,
-) -> Option<&arrow_buffer::NullBuffer> {
-    validity.and_then(|v| {
-        if v.null_count() == v.len() {
-            None
-        } else {
-            Some(v)
-        }
-    })
-}
-
-/// Helper function to merge validity buffers from two struct arrays
-/// Returns None only if both arrays are null at the same position
+/// Helper function to merge validity buffers from two struct arrays.
 ///
-/// Special handling for placeholder structs (all-null validity)
+/// A row is valid if it is valid in either input.
+/// An absent validity buffer means all rows are valid, an all-null buffer acts as the identity for this merge.
 fn merge_struct_validity(
     left_validity: Option<&arrow_buffer::NullBuffer>,
     right_validity: Option<&arrow_buffer::NullBuffer>,
 ) -> Option<arrow_buffer::NullBuffer> {
-    // Normalize both validity buffers (convert all-null to None)
-    let left_normalized = normalize_validity(left_validity);
-    let right_normalized = normalize_validity(right_validity);
-
-    match (left_normalized, right_normalized) {
+    match (left_validity, right_validity) {
         // Fast paths: no computation needed
-        (None, None) => None,
-        (Some(left), None) => Some(left.clone()),
-        (None, Some(right)) => Some(right.clone()),
+        (None, _) | (_, None) => None,
         (Some(left), Some(right)) => {
-            // Fast path: if both have no nulls, can return either one
-            if left.null_count() == 0 && right.null_count() == 0 {
+            if left.null_count() == 0 || right.null_count() == 0 {
+                return None;
+            }
+            if left.null_count() == left.len() {
+                return Some(right.clone());
+            }
+            if right.null_count() == right.len() {
                 return Some(left.clone());
             }
 
@@ -1385,9 +1370,12 @@ fn merge_with_schema(
                         );
                         let merged_validity =
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
+                        // `trimmed_values` starts at the first used value, so offsets
+                        // must be shifted to match or `ListArray::new` panics when the
+                        // input list was sliced (e.g. from a filtered batch).
                         let merged_list = ListArray::new(
                             child_field.clone(),
-                            left_list.offsets().clone(),
+                            left_list.trimmed_offsets(),
                             merged_values,
                             merged_validity,
                         );
@@ -1412,7 +1400,7 @@ fn merge_with_schema(
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
                         let merged_list = LargeListArray::new(
                             child_field.clone(),
-                            left_list.offsets().clone(),
+                            left_list.trimmed_offsets(),
                             merged_values,
                             merged_validity,
                         );
@@ -2054,6 +2042,47 @@ mod tests {
         assert_eq!(width_values.value(0), 300);
         assert_eq!(width_values.value(1), 200);
         assert!(width_values.is_null(2)); // width is null when right struct was null
+
+        // An all-null validity buffer is data, not a placeholder meaning "this side has no
+        // validity": merging two of them keeps the rows null.
+        let all_null_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+        let all_null_right = StructArray::new(
+            Fields::from(vec![Field::new("width", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+
+        let merged = merge(&all_null_left, &all_null_right);
+        assert_eq!(merged.null_count(), 2);
+
+        // An all-null side is the identity of the merge, so the other side decides each row.
+        let partial_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+        let merged = merge(&partial_left, &all_null_right);
+        assert!(!merged.is_null(0));
+        assert!(merged.is_null(1));
+
+        // A missing validity buffer means all rows are valid, which absorbs an all-null side.
+        let all_valid_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        );
+        let merged = merge(&all_valid_left, &all_null_right);
+        assert_eq!(merged.null_count(), 0);
+
+        // An explicit all-valid buffer has the same semantics as a missing buffer.
+        let all_valid: arrow_buffer::NullBuffer = vec![true, true].into();
+        let partial: arrow_buffer::NullBuffer = vec![true, false].into();
+        assert!(merge_struct_validity(Some(&all_valid), Some(&partial)).is_none());
+        assert!(merge_struct_validity(Some(&partial), Some(&all_valid)).is_none());
     }
 
     #[test]
@@ -2378,6 +2407,118 @@ mod tests {
         // merge left_list and right_list
         let merged_array = merge_with_schema(&left_list_struct, &right_list_struct, &target_fields);
         assert_eq!(merged_array.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_with_schema_sliced_list_struct() {
+        test_merge_with_schema_sliced_list_struct_generic::<i32>();
+    }
+
+    #[test]
+    fn test_merge_with_schema_sliced_large_list_struct() {
+        test_merge_with_schema_sliced_list_struct_generic::<i64>();
+    }
+
+    // Regression for #6580: merge_with_schema panicked when the left list was a
+    // sliced view whose offsets did not start at zero (common after a filtered
+    // scan). Cloning those offsets alongside `trimmed_values` produced offsets
+    // larger than the trimmed child, panicking in `(Large)ListArray::new`.
+    fn test_merge_with_schema_sliced_list_struct_generic<O: OffsetSizeTrait>() {
+        let make_list_dtype = |item_field: Arc<Field>| {
+            if O::IS_LARGE {
+                DataType::LargeList(item_field)
+            } else {
+                DataType::List(item_field)
+            }
+        };
+
+        // Build a List<Struct> with two rows of 5 items each, then slice away
+        // the first row so the remaining list's offsets start at 5, not 0.
+        let struct_fields_a = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
+        let left_values = Arc::new(StructArray::new(
+            struct_fields_a.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef],
+            None,
+        ));
+        let full_list = GenericListArray::<O>::new(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields_a), true)),
+            OffsetBuffer::<O>::from_lengths([5, 5]),
+            left_values,
+            None,
+        );
+        let sliced_left = full_list.slice(1, 1);
+        assert_eq!(sliced_left.offsets()[0].as_usize(), 5);
+        assert_eq!(sliced_left.offsets()[1].as_usize(), 10);
+
+        let struct_fields_b = Fields::from(vec![Field::new("b", DataType::Int32, true)]);
+        let right_values = Arc::new(StructArray::new(
+            struct_fields_b.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(100..105)) as ArrayRef],
+            None,
+        ));
+        let right_list = GenericListArray::<O>::new(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields_b), true)),
+            OffsetBuffer::<O>::from_lengths([5]),
+            right_values,
+            None,
+        );
+
+        let target_item_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ])),
+            true,
+        ));
+        let target_fields = Fields::from(vec![Field::new(
+            "items",
+            make_list_dtype(target_item_field),
+            true,
+        )]);
+
+        let left_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "items",
+                sliced_left.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(sliced_left) as ArrayRef],
+        )
+        .unwrap();
+        let right_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "items",
+                right_list.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(right_list) as ArrayRef],
+        )
+        .unwrap();
+
+        let merged = left_batch
+            .merge_with_schema(&right_batch, &Schema::new(target_fields.to_vec()))
+            .unwrap();
+
+        let merged_list = merged
+            .column_by_name("items")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<GenericListArray<O>>()
+            .unwrap();
+        assert_eq!(merged_list.len(), 1);
+        assert_eq!(merged_list.value_length(0).as_usize(), 5);
+        let merged_struct = merged_list.values().as_struct();
+        assert_eq!(merged_struct.num_columns(), 2);
+        let a = merged_struct
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        // After shifting offsets to zero, values 5..10 should be first.
+        let a_vals: Vec<i32> = a.iter().map(|v| v.unwrap()).collect();
+        assert_eq!(a_vals, vec![5, 6, 7, 8, 9]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
+use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
 
@@ -34,8 +35,8 @@ use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::{
-    version::LanceFileVersion,
-    writer::{FileWriter, FileWriterOptions},
+    version::{ConcreteFileVersion, LanceFileVersion},
+    writer::FileWriterOptions,
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
@@ -448,13 +449,10 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
             .create(&dataset.data_dir().join(file_name))
             .await
             .unwrap();
-        let mut writer = FileWriter::try_new(
+        let mut writer = lance_file::versions::v2_2::create_writer(
             object_writer,
             crate::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
         writer.write_batch(&batch).await.unwrap();
@@ -871,6 +869,76 @@ async fn test_load_manifest_iops() {
     assert_io_eq!(io_stats, read_iops, 1);
 }
 
+#[tokio::test]
+async fn test_checkout_removed_version_not_served_from_cache() {
+    let test_uri = TempStrDir::default();
+    let session = Arc::new(Session::default());
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let version = dataset.manifest().version;
+    let location = dataset.manifest_location().clone();
+    let cache = session.metadata_cache.for_dataset(&dataset.uri);
+
+    assert!(
+        cache
+            .get_with_key(&ManifestKey {
+                version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_some(),
+        "manifest should be cached after the write"
+    );
+    dataset.checkout_version(version).await.unwrap();
+
+    // Remove the version from storage, as cleanup (or a manual delete) would.
+    dataset.object_store.delete(&location.path).await.unwrap();
+
+    let resolved = dataset
+        .commit_handler
+        .resolve_version_location(&dataset.base, version, &dataset.object_store.inner)
+        .await
+        .unwrap();
+    assert!(
+        resolved.size.is_none(),
+        "resolving a removed version must fall back to a size-less location, got {:?}",
+        resolved.size
+    );
+
+    cache
+        .insert_with_key(
+            &ManifestKey {
+                version,
+                e_tag: None,
+            },
+            Arc::new(dataset.manifest().clone()),
+        )
+        .await;
+    assert!(
+        dataset.checkout_version(version).await.is_err(),
+        "checkout of a version removed from storage must not be served from cache"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_write_params(
@@ -914,15 +982,18 @@ async fn test_write_params(
     assert_eq!(dataset.count_fragments(), 10);
     for fragment in &fragments {
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
-        let reader = fragment
-            .open(dataset.schema(), FragReadConfig::default())
-            .await
-            .unwrap();
         // No group / batch concept in v2
         if data_storage_version == LanceFileVersion::Legacy {
-            assert_eq!(reader.legacy_num_batches(), 10);
-            for i in 0..reader.legacy_num_batches() as u32 {
-                assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
+            let reader = crate::dataset::versions::open_v1_fragment_reader(
+                fragment,
+                dataset.schema(),
+                &FragReadConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reader.num_batches(), 10);
+            for i in 0..reader.num_batches() as u32 {
+                assert_eq!(reader.num_rows_in_batch(i).unwrap(), 10);
             }
         }
     }
@@ -931,7 +1002,11 @@ async fn test_write_params(
 #[rstest]
 #[tokio::test]
 async fn test_write_manifest(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    #[values(
+        LanceFileVersion::Legacy,
+        LanceFileVersion::Stable,
+        LanceFileVersion::Next
+    )]
     data_storage_version: LanceFileVersion,
 ) {
     use lance_table::feature_flags::FLAG_UNKNOWN;
@@ -980,8 +1055,12 @@ async fn test_write_manifest(
 
     assert_eq!(
         manifest.data_storage_format,
-        DataStorageFormat::new(data_storage_version)
+        DataStorageFormat::new(data_storage_version.resolve())
     );
+    assert!(!matches!(
+        manifest.data_storage_format.version.to_manifest_string(),
+        "stable" | "next"
+    ));
     assert_eq!(manifest.reader_feature_flags, 0);
 
     // Create one with deletions
@@ -1100,8 +1179,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .await
     .unwrap();
     assert_eq!(
-        manifest.data_storage_format.lance_file_version().unwrap(),
-        LanceFileVersion::V2_3
+        manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let append_batch = RecordBatch::try_new(
@@ -1123,12 +1202,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let actual = dataset.scan().try_into_batch().await.unwrap();
@@ -1170,12 +1245,8 @@ async fn test_rle_v2_uncommitted_create_commits_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -1210,12 +1281,8 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        clone
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        clone.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -1451,6 +1518,132 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+}
+
+#[tokio::test]
+async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
+    use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let source_uri = source_dir.to_str().unwrap();
+    let target_dir = test_dir.join("target");
+    let target_uri = target_dir.to_str().unwrap();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(32), BatchCount::from(1));
+    let mut source = Dataset::write(
+        data_reader,
+        source_uri,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let source_transaction_file = source.manifest().transaction_file.clone();
+
+    handler.fail_next(AmbiguousFailure::LandAndConflict);
+    let cloned = source
+        .deep_clone(target_uri, source.version().version, None)
+        .await
+        .expect("readback must identify the deep-clone transaction that landed");
+
+    assert_eq!(cloned.count_rows(None).await.unwrap(), 32);
+    assert_ne!(cloned.manifest().transaction_file, source_transaction_file);
+    assert!(cloned.manifest().transaction_section.is_some());
+}
+
+// Uses an in-memory source store to force a cross-store copy. The in-memory store has
+// known platform-specific quirks on Windows (it reads back empty there; see the note in
+// tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is
+// covered on Windows by `test_deep_clone` (same-store), and the cross-store streaming path
+// against real cloud stores is platform-agnostic std/tokio I/O.
+#[cfg(not(windows))]
+#[rstest]
+#[tokio::test]
+async fn test_deep_clone_cross_store(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    // Source lives in an in-memory store while the target is a local directory, so the
+    // two stores have different `store_prefix`es and `deep_clone` must stream files from
+    // the source store to the target store (the cross-account code path).
+    let session = Arc::new(Session::default());
+    let test_dir = TempStdDir::default();
+    let clone_dir = test_dir.join("clone_ds");
+    let cloned_uri = clone_dir.to_str().unwrap();
+
+    // 64 rows across 4 files exercises the multi-fragment copy path.
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("val", array::fill_utf8("deep".to_string()))
+        .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+
+    let mut dataset = Dataset::write(
+        data_reader,
+        "memory://cross_store_src",
+        Some(WriteParams {
+            max_rows_per_file: 16,
+            max_rows_per_group: 16,
+            data_storage_version: Some(data_storage_version),
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_ne!(dataset.object_store.store_prefix, "");
+
+    // Create a scalar index so the index files and the manifest index section are also
+    // copied across stores (the index section is read through the source store at commit).
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Delete some rows so a deletion file is also streamed across stores.
+    dataset.delete("id < 10").await.unwrap();
+    let cloned_dataset = dataset
+        .deep_clone(cloned_uri, dataset.version().version, None)
+        .await
+        .unwrap();
+
+    // The clone targets a local store, distinct from the in-memory source.
+    assert_ne!(
+        cloned_dataset.object_store.store_prefix,
+        dataset.object_store.store_prefix
+    );
+    assert!(cloned_dataset.manifest().base_paths.is_empty());
+
+    // Re-open the clone from a fresh session to prove the files were physically copied
+    // into the target store and the clone is fully independent of the source store.
+    let reopened = DatasetBuilder::from_uri(cloned_uri).load().await.unwrap();
+    let batches = reopened
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 54); // 64 rows - 10 deletions
+
+    // The scalar index must have been copied and resolve against the target store, with its
+    // base reference normalized to local (no external base_paths).
+    let cloned_indices = reopened.load_indices().await.unwrap();
+    assert_eq!(cloned_indices.len(), 1);
+    assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
+    assert!(cloned_indices.iter().all(|idx| idx.base_id.is_none()));
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)
@@ -1927,6 +2120,53 @@ async fn append_dictionary(
 }
 
 #[rstest]
+#[case::appended_null_value(
+    (0..=i8::MAX)
+        .map(|value| Some(format!("value-{value}")))
+        .collect(),
+    (0..=i8::MAX).map(Some).chain([None]).collect()
+)]
+#[case::existing_unaddressable_null_value(
+    (0..130)
+        .map(|value| (value != 129).then(|| format!("value-{value}")))
+        .collect(),
+    vec![Some(0_i8), None]
+)]
+#[tokio::test]
+async fn write_rejects_dictionary_null_index_outside_declared_key_range(
+    #[case] values: Vec<Option<String>>,
+    #[case] indices: Vec<Option<i8>>,
+) {
+    let dictionary = Arc::new(StringArray::from(values));
+    let indices = Int8Array::from(indices);
+    let dictionary = Int8DictionaryArray::try_new(indices, dictionary).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect_err("the widened indices cannot be represented by Int8");
+
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn overwrite_dataset(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -1985,9 +2225,10 @@ async fn overwrite_dataset(
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    // Fragment ids reset after overwrite.
-    assert_eq!(fragments[0].id(), 0);
-    assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
+    // Fragment ids continue from the dataset's high water mark after an
+    // overwrite; they are never reused.
+    assert_eq!(fragments[0].id(), 1);
+    assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
 
     let actual_ds = Dataset::open(&test_uri).await.unwrap();
     assert_eq!(actual_ds.version().version, 2);
@@ -2254,12 +2495,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 
     let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
@@ -2275,12 +2512,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 }
 
