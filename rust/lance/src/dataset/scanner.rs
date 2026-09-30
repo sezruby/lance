@@ -6409,8 +6409,10 @@ impl Scanner {
     ///   `fast_search`, which searches only the selected segments anyway).
     ///
     /// Both fixed and adaptive nprobes are supported: the batch node applies the
-    /// same initial probe budget and late-search expansion as the single-query
-    /// path, so each query probes the same partitions it would probe alone.
+    /// same initial probe budget and sequential late-search cut. Across deltas
+    /// it consumes results round-robin, while single-query search follows their
+    /// nondeterministic completion order. Explicit parallel adaptive probing
+    /// falls back because it can search beyond the sequential cut.
     async fn batch_index_search_supported(
         &self,
         index_name: &str,
@@ -6430,6 +6432,13 @@ impl Scanner {
         // to its late search; fall back so the per-query loop keeps defining
         // those semantics rather than reproducing them in the batch node.
         if q.minimum_nprobes == 0 {
+            return Ok(false);
+        }
+        // Parallel late search can admit more partitions before observing the
+        // shared stop count. Preserve that behavior for callers that requested it.
+        if q.maximum_nprobes != Some(q.minimum_nprobes)
+            && (q.query_parallelism == -1 || q.query_parallelism > 1)
+        {
             return Ok(false);
         }
         // The per-query path threads a caller-supplied external row-address mask
@@ -11466,7 +11475,11 @@ mod test {
     /// partitions for the adaptive budget and late search to diverge from a
     /// fixed probe count. With `is_multi_delta`, 500 more rows are appended and
     /// indexed as a second delta.
-    async fn adaptive_batch_dataset(index_type: &str, is_multi_delta: bool) -> Dataset {
+    async fn adaptive_batch_dataset(
+        index_type: &str,
+        is_multi_delta: bool,
+        metric: MetricType,
+    ) -> Dataset {
         let mut dataset = gen_batch()
             .col("i", array::step::<Int32Type>())
             .col(
@@ -11477,8 +11490,14 @@ mod test {
             .await
             .unwrap();
         let params = match index_type {
-            "IVF_FLAT" => VectorIndexParams::ivf_flat(16, MetricType::L2),
-            "IVF_PQ" => VectorIndexParams::ivf_pq(16, 8, 4, MetricType::L2, 10),
+            "IVF_FLAT" => VectorIndexParams::ivf_flat(16, metric),
+            "IVF_PQ" => VectorIndexParams::ivf_pq(16, 8, 4, metric, 10),
+            "IVF_SQ" => VectorIndexParams::with_ivf_sq_params(
+                metric,
+                IvfBuildParams::new(16),
+                SQBuildParams::default(),
+            ),
+            "IVF_RQ" => VectorIndexParams::ivf_rq(16, 8, metric),
             other => panic!("unsupported index type {other}"),
         };
         dataset
@@ -11569,14 +11588,16 @@ mod test {
     #[case::no_filter(None, None)]
     #[case::late_search(Some("i % 97 = 0"), None)]
     #[case::late_search_capped(Some("i % 97 = 0"), Some(3))]
+    #[case::maximum_exceeds_partitions(Some("i % 97 = 0"), Some(99))]
     #[case::fewer_than_k_match(Some("i < 5"), None)]
+    #[case::no_matches(Some("i < 0"), None)]
     #[tokio::test]
     async fn test_batch_knn_adaptive_nprobes_matches_single(
-        #[values("IVF_FLAT", "IVF_PQ")] index_type: &str,
+        #[values("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_RQ")] index_type: &str,
         #[case] filter: Option<&str>,
         #[case] maximum_nprobes: Option<usize>,
     ) {
-        let dataset = adaptive_batch_dataset(index_type, false).await;
+        let dataset = adaptive_batch_dataset(index_type, false, MetricType::L2).await;
         let query_values = adaptive_batch_queries(&dataset).await;
         let queries = FixedSizeListArray::try_new_from_values(
             Float32Array::from(query_values.clone()),
@@ -11634,17 +11655,45 @@ mod test {
         }
         // Capping maximum_nprobes limits recall by design; the equality above
         // is what matters there.
-        if maximum_nprobes.is_none() {
+        if maximum_nprobes.is_none() && expected_total > 0 {
             let recall = hits as f32 / expected_total as f32;
             assert!(recall >= 0.5, "{index_type} recall {recall} below 0.5");
         }
-        if filter == Some("i < 5") {
+        if filter == Some("i < 0") {
+            assert_eq!(batch.num_rows(), 0);
+        } else if filter == Some("i < 5") {
             // Only 5 rows can match, and the shortcut returns all of them.
             assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * 5);
         } else if maximum_nprobes.is_none() {
             // Late search keeps probing until every query has k rows.
             assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * k);
         }
+    }
+
+    #[rstest]
+    #[case::auto(0, true)]
+    #[case::sequential(1, true)]
+    #[case::parallel(4, false)]
+    #[case::all_cpus(-1, false)]
+    #[tokio::test]
+    async fn test_batch_knn_adaptive_query_parallelism(
+        #[case] parallelism: i32,
+        #[case] uses_batch: bool,
+    ) {
+        let dataset = adaptive_batch_dataset("IVF_FLAT", false, MetricType::L2).await;
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(adaptive_batch_queries(&dataset).await),
+            ADAPTIVE_DIM as i32,
+        )
+        .unwrap();
+        let mut scan = dataset.scan();
+        configure_adaptive_scan(&mut scan, &queries, 10, Some("i % 97 = 0"), Some(3), true);
+        scan.query_parallelism(parallelism);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ANNIvfBatch"), uses_batch, "got:\n{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert!(batch.num_rows() <= ADAPTIVE_QUERIES * 10);
     }
 
     /// Across delta segments the late search shares each query's found count,
@@ -11657,7 +11706,7 @@ mod test {
     #[case::late_search_newer_delta(Some("i >= 2000 AND i % 7 = 0"))]
     #[tokio::test]
     async fn test_batch_knn_adaptive_nprobes_multiple_deltas(#[case] filter: Option<&str>) {
-        let dataset = adaptive_batch_dataset("IVF_FLAT", true).await;
+        let dataset = adaptive_batch_dataset("IVF_FLAT", true, MetricType::L2).await;
         let query_values = adaptive_batch_queries(&dataset).await;
         let queries = FixedSizeListArray::try_new_from_values(
             Float32Array::from(query_values.clone()),
@@ -11711,6 +11760,72 @@ mod test {
         }
         let recall = hits as f32 / (ADAPTIVE_QUERIES * k) as f32;
         assert!(recall >= 0.5, "recall {recall} below 0.5");
+    }
+
+    #[rstest]
+    #[case::unfiltered(None)]
+    #[case::prefiltered(Some("i % 97 = 0"))]
+    #[tokio::test]
+    async fn test_batch_knn_adaptive_metrics(
+        #[values(MetricType::Cosine, MetricType::Dot)] metric: MetricType,
+        #[case] filter: Option<&str>,
+    ) {
+        let dataset = adaptive_batch_dataset("IVF_FLAT", false, metric).await;
+        let query_values = adaptive_batch_queries(&dataset).await;
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values.clone()),
+            ADAPTIVE_DIM as i32,
+        )
+        .unwrap();
+        let mut scan = dataset.scan();
+        configure_adaptive_scan(&mut scan, &queries, 10, filter, None, true);
+        scan.distance_metric(metric);
+        assert!(
+            scan.explain_plan(false)
+                .await
+                .unwrap()
+                .contains("ANNIvfBatch")
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut hits = 0;
+        for query_index in 0..ADAPTIVE_QUERIES {
+            let query = Float32Array::from(
+                query_values[query_index * ADAPTIVE_DIM..(query_index + 1) * ADAPTIVE_DIM].to_vec(),
+            );
+            let mut single_scan = dataset.scan();
+            configure_adaptive_scan(&mut single_scan, &query, 10, filter, None, true);
+            single_scan.distance_metric(metric);
+            let single = single_scan.try_into_batch().await.unwrap();
+            let rows = rows_for_query(&batch, query_index);
+            assert_eq!(
+                rows["i"].as_primitive::<Int32Type>().values(),
+                single["i"].as_primitive::<Int32Type>().values()
+            );
+            assert_eq!(
+                rows[DIST_COL].as_primitive::<Float32Type>().values(),
+                single[DIST_COL].as_primitive::<Float32Type>().values()
+            );
+
+            let mut flat_scan = dataset.scan();
+            configure_adaptive_scan(&mut flat_scan, &query, 10, filter, None, false);
+            flat_scan.distance_metric(metric);
+            let flat = flat_scan.try_into_batch().await.unwrap();
+            let expected: HashSet<_> = flat["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            hits += rows["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .filter(|id| expected.contains(id))
+                .count();
+        }
+        assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * 10);
+        let recall = hits as f32 / (ADAPTIVE_QUERIES * 10) as f32;
+        assert!(recall >= 0.5, "{metric:?} recall {recall} below 0.5");
     }
 
     /// An in-place vector update (`update_columns` + `Operation::Update`) prunes the

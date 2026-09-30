@@ -19,9 +19,11 @@
 //! delta. The late search runs in rounds: each still-active query contributes
 //! its next few partitions (a *wave*), every distinct partition in the round is
 //! loaded once, and each query then consumes its wave in rank order and stops
-//! at the same partition the sequential single-query search would stop at. Rows
-//! from partitions after that cut are discarded so results stay identical;
-//! the wave width doubles per round to bound both round count and wasted work.
+//! at the same partition a sequential single-delta search would stop at. Rows
+//! from partitions after that cut are discarded. With multiple deltas, results
+//! are consumed round-robin rather than following the single-query path's
+//! nondeterministic completion order. The wave width doubles per round, subject
+//! to a strict total probe cap across all queries and deltas.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -217,6 +219,71 @@ pub(super) async fn search_batch(
 /// Upper bound on (query, partition) probes issued in one late-search round.
 const MAX_LATE_PROBES_PER_ROUND: usize = 1024;
 
+struct LateSearchProgress {
+    cursor: Vec<Vec<usize>>,
+    wave: Vec<Vec<usize>>,
+    next_pair: (usize, usize),
+}
+
+impl LateSearchProgress {
+    fn new(deltas: &[BatchDelta], query_count: usize) -> Self {
+        Self {
+            cursor: deltas
+                .iter()
+                .map(|delta| delta.plans.iter().map(|plan| plan.early_end).collect())
+                .collect(),
+            wave: vec![vec![1; query_count]; deltas.len()],
+            next_pair: (0, 0),
+        }
+    }
+
+    /// Rotate through (query, delta) pairs, clipping the last wave to the remaining
+    /// budget. Rotating pairs rather than queries also handles more deltas than
+    /// the cap without starving any delta.
+    fn plan_round(
+        &mut self,
+        deltas: &[BatchDelta],
+        found: &[usize],
+        is_active: &[bool],
+        budget: usize,
+        max_probes: usize,
+    ) -> Vec<Vec<(usize, usize)>> {
+        let mut round = vec![Vec::new(); deltas.len()];
+        if deltas.is_empty() || found.is_empty() {
+            return round;
+        }
+        debug_assert!(max_probes > 0, "late-search probe cap must be positive");
+        let start = self.next_pair;
+        let mut remaining_probes = max_probes;
+        loop {
+            let (query_index, delta_index) = self.next_pair;
+            self.next_pair.1 += 1;
+            if self.next_pair.1 == deltas.len() {
+                self.next_pair.1 = 0;
+                self.next_pair.0 = (query_index + 1) % found.len();
+            }
+            let delta = &deltas[delta_index];
+            if is_active[query_index]
+                && found[query_index] < budget
+                && delta.joins_late_search(query_index)
+            {
+                let remaining =
+                    delta.plans[query_index].late_end - self.cursor[delta_index][query_index];
+                let width = self.wave[delta_index][query_index]
+                    .min(remaining)
+                    .min(remaining_probes);
+                if width > 0 {
+                    round[delta_index].push((query_index, width));
+                    remaining_probes -= width;
+                }
+            }
+            if remaining_probes == 0 || self.next_pair == start {
+                return round;
+            }
+        }
+    }
+}
+
 /// Adaptive completion after the early search of every delta.
 ///
 /// `candidates[i]` holds query `i`'s early-search rows from all deltas and is
@@ -302,58 +369,11 @@ pub(super) async fn late_search(
     // Each virtual query copies its query vector, so bound the per-round total to
     // keep key memory and per-query setup independent of batch size × CPU count.
     let max_round_probes = MAX_LATE_PROBES_PER_ROUND.max(max_wave);
-    // Per (delta, query) progress. Every round advances all deltas together, like
-    // the single-query path whose per-delta late searches run concurrently.
-    let mut cursor: Vec<Vec<usize>> = deltas
-        .iter()
-        .map(|delta| delta.plans.iter().map(|plan| plan.early_end).collect())
-        .collect();
-    let mut wave: Vec<Vec<usize>> = vec![vec![1; query_count]; deltas.len()];
-    // Rotates the starting query so a capped round does not starve later queries.
-    let mut rotation = 0;
+    let mut progress = LateSearchProgress::new(deltas, query_count);
     loop {
-        // round[delta] = (query, width) pairs probed in that delta this round.
-        let mut round: Vec<Vec<(usize, usize)>> = vec![Vec::new(); deltas.len()];
-        let mut round_probes = 0;
-        let mut last_admitted = None;
-        let mut is_pending = false;
-        for step in 0..query_count {
-            let query_index = (rotation + step) % query_count;
-            if !is_active[query_index] || found[query_index] >= budget {
-                continue;
-            }
-            let widths: Vec<usize> = (0..deltas.len())
-                .map(|d| {
-                    if !deltas[d].joins_late_search(query_index) {
-                        return 0;
-                    }
-                    let remaining = deltas[d].plans[query_index]
-                        .late_end
-                        .saturating_sub(cursor[d][query_index]);
-                    wave[d][query_index].min(remaining)
-                })
-                .collect();
-            let query_probes: usize = widths.iter().sum();
-            if query_probes == 0 {
-                continue;
-            }
-            if round_probes >= max_round_probes {
-                is_pending = true;
-                break;
-            }
-            round_probes += query_probes;
-            last_admitted = Some(query_index);
-            for (d, &width) in widths.iter().enumerate() {
-                if width > 0 {
-                    round[d].push((query_index, width));
-                }
-            }
-        }
-        let Some(last_admitted) = last_admitted else {
+        let round = progress.plan_round(deltas, &found, &is_active, budget, max_round_probes);
+        if round.iter().all(Vec::is_empty) {
             break;
-        };
-        if is_pending {
-            rotation = (last_admitted + 1) % query_count;
         }
 
         let searches = deltas
@@ -370,7 +390,7 @@ pub(super) async fn late_search(
                 let mut q_c_dists = Vec::with_capacity(probe_count);
                 for &(query_index, width) in probes {
                     let plan = &delta.plans[query_index];
-                    let start = cursor[d][query_index];
+                    let start = progress.cursor[d][query_index];
                     let key = delta.query.key.slice(query_index * dim, dim);
                     for offset in start..start + width {
                         keys.push(key.clone());
@@ -400,7 +420,7 @@ pub(super) async fn late_search(
         let delta_results = futures::future::try_join_all(searches).await?;
 
         // Per query, the probe results of each delta in rank order.
-        let mut per_query: Vec<Vec<std::vec::IntoIter<RecordBatch>>> =
+        let mut per_query: Vec<Vec<(usize, std::vec::IntoIter<RecordBatch>)>> =
             vec![Vec::new(); query_count];
         for (d, results) in delta_results {
             let mut results = results.into_iter();
@@ -411,27 +431,26 @@ pub(super) async fn late_search(
                         "late batch search returned fewer results than probes".to_string(),
                     ));
                 }
-                per_query[query_index].push(batches.into_iter());
-                grow_wave(&mut wave[d][query_index], max_wave);
+                per_query[query_index].push((d, batches.into_iter()));
+                progress.wave[d][query_index] = progress.wave[d][query_index]
+                    .saturating_mul(2)
+                    .min(max_wave);
             }
         }
         // Consume each query's partitions round-robin across deltas, stopping at the
         // budget exactly like the sequential search checks it before each partition.
         for (query_index, mut streams) in per_query.into_iter().enumerate() {
-            let delta_ids: Vec<usize> = (0..deltas.len())
-                .filter(|&d| round[d].iter().any(|&(q, _)| q == query_index))
-                .collect();
             let mut is_progress = true;
             while is_progress && found[query_index] < budget {
                 is_progress = false;
-                for (stream, &d) in streams.iter_mut().zip(&delta_ids) {
+                for (d, stream) in &mut streams {
                     if found[query_index] >= budget {
                         break;
                     }
                     if let Some(batch) = stream.next() {
                         found[query_index] +=
                             append_candidates(&batch, &mut candidates[query_index])?;
-                        cursor[d][query_index] += 1;
+                        progress.cursor[*d][query_index] += 1;
                         is_progress = true;
                     }
                 }
@@ -441,7 +460,261 @@ pub(super) async fn late_search(
     Ok(())
 }
 
-/// Doubles a late-search wave width, capped at `max_wave`.
-fn grow_wave(wave: &mut usize, max_wave: usize) {
-    *wave = (*wave * 2).min(max_wave);
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use lance_select::RowAddrTreeMap;
+    use rstest::rstest;
+
+    use super::super::tests::{
+        PreparedThreadCapturingIndex, base_query, empty_prefilter, prefilter_with_mask,
+        prepared_index_multi, prepared_metrics,
+    };
+    use super::*;
+
+    fn delta(
+        row_ids: Vec<Vec<u64>>,
+        query_count: usize,
+        pre_filter: Arc<DatasetPreFilter>,
+    ) -> (BatchDelta, Arc<Mutex<Vec<usize>>>) {
+        let partition_count = row_ids.len();
+        let (index, _, searched, _) = prepared_index_multi(row_ids);
+        let partitions = Arc::new(UInt32Array::from_iter_values(0..partition_count as u32));
+        let distances = Arc::new(Float32Array::from_iter_values(
+            (0..partition_count).map(|i| i as f32),
+        ));
+        let mut query = base_query();
+        query.key = Arc::new(Float32Array::from(vec![0.0; query_count]));
+        let plans = (0..query_count)
+            .map(|_| QueryProbePlan {
+                partitions: partitions.clone(),
+                q_c_dists: distances.clone(),
+                early_end: 1,
+                late_end: partition_count,
+            })
+            .collect();
+        (
+            BatchDelta {
+                index,
+                query,
+                plans,
+                pre_filter,
+                seg_mask: None,
+            },
+            searched,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_late_search_enforces_probe_limit() {
+        let pre_filter = empty_prefilter().await;
+        let query_count = MAX_LATE_PROBES_PER_ROUND + 1;
+        let (delta, _) = delta(vec![vec![]; 64], query_count, pre_filter.clone());
+        let sizes = delta
+            .index
+            .as_any()
+            .downcast_ref::<PreparedThreadCapturingIndex>()
+            .unwrap()
+            .batch_sizes
+            .clone();
+        let mut candidates = vec![vec![]; query_count];
+        late_search(
+            &[delta],
+            1,
+            1,
+            pre_filter,
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        let limit = MAX_LATE_PROBES_PER_ROUND.max(get_num_compute_intensive_cpus());
+        let sizes = sizes.lock().unwrap();
+        assert!(
+            sizes.iter().all(|&size| size <= limit),
+            "every late-search round must obey its probe limit: {sizes:?}"
+        );
+        assert!(candidates.iter().all(Vec::is_empty));
+    }
+
+    #[rstest]
+    #[case::partial_wave(6, 2, 17)]
+    #[case::many_deltas(1, 129, 1024)]
+    #[case::many_queries(1025, 1, 1024)]
+    #[case::one_probe(3, 4, 1)]
+    #[tokio::test]
+    async fn test_late_round_cap_and_fairness(
+        #[case] query_count: usize,
+        #[case] delta_count: usize,
+        #[case] cap: usize,
+    ) {
+        let pre_filter = empty_prefilter().await;
+        let deltas: Vec<_> = (0..delta_count)
+            .map(|_| delta(vec![vec![]; 33], query_count, pre_filter.clone()).0)
+            .collect();
+        let mut progress = LateSearchProgress::new(&deltas, query_count);
+        progress.wave.iter_mut().for_each(|waves| waves.fill(16));
+        let found = vec![0; query_count];
+        let is_active = vec![true; query_count];
+        let expected_probes = query_count * delta_count * 32;
+        let mut total_probes = 0;
+        for _ in 0..=expected_probes {
+            let round = progress.plan_round(&deltas, &found, &is_active, 1, cap);
+            let probes: usize = round.iter().flatten().map(|&(_, width)| width).sum();
+            assert!(probes <= cap, "round issued {probes} probes, cap is {cap}");
+            if probes == 0 {
+                break;
+            }
+            total_probes += probes;
+            for (delta_index, probes) in round.iter().enumerate() {
+                for &(query_index, width) in probes {
+                    progress.cursor[delta_index][query_index] += width;
+                }
+            }
+        }
+        assert_eq!(total_probes, expected_probes);
+        assert!(progress.cursor.iter().flatten().all(|&cursor| cursor == 33));
+    }
+
+    #[rstest]
+    #[case::both_deltas(vec![10], vec![20], vec![10, 20])]
+    #[case::newer_delta_only(vec![], vec![20, 21], vec![20, 21])]
+    #[tokio::test]
+    async fn test_late_search_advances_deltas_together(
+        #[case] first_rows: Vec<u64>,
+        #[case] second_rows: Vec<u64>,
+        #[case] expected_rows: Vec<u64>,
+    ) {
+        let pre_filter = empty_prefilter().await;
+        let (first, first_searched) =
+            delta(vec![vec![], first_rows, vec![11]], 1, pre_filter.clone());
+        let (second, second_searched) =
+            delta(vec![vec![], second_rows, vec![22]], 1, pre_filter.clone());
+        let mut candidates = vec![vec![]];
+        late_search(
+            &[first, second],
+            1,
+            2,
+            pre_filter,
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        let rows: Vec<_> = candidates[0].iter().map(|&(_, row_id)| row_id).collect();
+        assert_eq!(rows, expected_rows);
+        assert_eq!(*first_searched.lock().unwrap(), vec![1]);
+        assert_eq!(*second_searched.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_late_search_discards_rows_after_the_cut() {
+        let pre_filter = empty_prefilter().await;
+        let (delta, _) = delta(
+            vec![vec![], vec![10, 11], vec![12, 13], vec![14]],
+            1,
+            pre_filter.clone(),
+        );
+        let mut candidates = vec![vec![(0.0, 40)]];
+        late_search(
+            &[delta],
+            1,
+            4,
+            pre_filter,
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        let rows: Vec<_> = candidates[0].iter().map(|&(_, row_id)| row_id).collect();
+        assert_eq!(rows, vec![40, 10, 11, 12, 13]);
+    }
+
+    #[tokio::test]
+    async fn test_late_search_does_not_count_unowned_rows() {
+        let pre_filter = empty_prefilter().await;
+        let (mut first, _) = delta(vec![vec![], vec![10], vec![11]], 1, pre_filter.clone());
+        first.seg_mask = Some(Arc::new(RowAddrMask::from_allowed(
+            [12_u64].into_iter().collect::<RowAddrTreeMap>(),
+        )));
+        let (second, _) = delta(vec![vec![], vec![20], vec![21]], 1, pre_filter.clone());
+        let mut candidates = vec![vec![]];
+        late_search(
+            &[first, second],
+            1,
+            1,
+            pre_filter,
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(candidates, vec![vec![(1.0, 20)]]);
+    }
+
+    #[rstest]
+    #[case::restricted(false, vec![10, 20])]
+    #[case::unrestricted(true, vec![10, 20, 30])]
+    #[tokio::test]
+    async fn test_shortcut_respects_segment_ownership(
+        #[case] is_unrestricted: bool,
+        #[case] expected_rows: Vec<u64>,
+    ) {
+        let pre_filter = prefilter_with_mask(Some(RowAddrMask::from_allowed(
+            [10_u64, 20, 30].into_iter().collect::<RowAddrTreeMap>(),
+        )))
+        .await;
+        let (mut first, first_searched) = delta(vec![vec![], vec![10]], 1, pre_filter.clone());
+        if !is_unrestricted {
+            first.seg_mask = Some(Arc::new(RowAddrMask::from_allowed(
+                [10_u64].into_iter().collect::<RowAddrTreeMap>(),
+            )));
+        }
+        let (mut second, second_searched) = delta(vec![vec![], vec![20]], 1, pre_filter.clone());
+        second.seg_mask = Some(Arc::new(RowAddrMask::from_allowed(
+            [20_u64].into_iter().collect::<RowAddrTreeMap>(),
+        )));
+        let mut candidates = vec![vec![(0.0, 10)]];
+        late_search(
+            &[first, second],
+            1,
+            4,
+            pre_filter,
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        let rows: Vec<_> = candidates[0].iter().map(|&(_, row_id)| row_id).collect();
+        assert_eq!(rows, expected_rows);
+        assert!(
+            candidates[0]
+                .iter()
+                .skip(1)
+                .all(|&(dist, _)| dist == f32::INFINITY)
+        );
+        assert!(first_searched.lock().unwrap().is_empty());
+        assert!(second_searched.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_late_search_skips_empty_ownership() {
+        let pre_filter = empty_prefilter().await;
+        let (mut delta, searched) = delta(vec![vec![], vec![10]], 1, pre_filter.clone());
+        delta.seg_mask = Some(Arc::new(RowAddrMask::allow_nothing()));
+        let mut candidates = vec![vec![]];
+        late_search(
+            &[delta],
+            1,
+            1,
+            pre_filter,
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(searched.lock().unwrap().is_empty());
+        assert!(candidates[0].is_empty());
+    }
 }

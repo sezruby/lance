@@ -3035,7 +3035,7 @@ mod tests {
     use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;
 
-    fn base_query() -> Query {
+    pub(super) fn base_query() -> Query {
         Query {
             column: "vec".to_string(),
             key: Arc::new(Float32Array::from(vec![0.0f32])) as ArrayRef,
@@ -3121,7 +3121,7 @@ mod tests {
     }
 
     #[derive(Debug, DeepSizeOf)]
-    struct PreparedThreadCapturingIndex {
+    pub(super) struct PreparedThreadCapturingIndex {
         metric: DistanceType,
         kind: PreparedIndexKind,
         prepared_partitions: Arc<Mutex<Vec<usize>>>,
@@ -3129,6 +3129,7 @@ mod tests {
         search_threads: Arc<Mutex<Vec<String>>>,
         /// The rows each partition returns, indexed by partition id.
         row_ids: Vec<Vec<u64>>,
+        pub(super) batch_sizes: Arc<Mutex<Vec<usize>>>,
     }
 
     #[async_trait]
@@ -3356,6 +3357,59 @@ mod tests {
             !matches!(self.kind, PreparedIndexKind::Legacy)
         }
 
+        async fn search_partitions_batch(
+            self: Arc<Self>,
+            query: Query,
+            partitions_per_query: Vec<Arc<UInt32Array>>,
+            _q_c_dists_per_query: Vec<Arc<Float32Array>>,
+            pre_filter: Arc<dyn PreFilter>,
+            metrics: Arc<dyn MetricsCollector>,
+        ) -> Result<Vec<RecordBatch>> {
+            self.batch_sizes
+                .lock()
+                .unwrap()
+                .push(partitions_per_query.len());
+            pre_filter.wait_for_ready().await?;
+            let mask = pre_filter.mask();
+            partitions_per_query
+                .into_iter()
+                .map(|partitions| {
+                    let mut rows = Vec::new();
+                    for &partition_id in partitions.values() {
+                        let batch = self.search_prepared_partition(
+                            Box::new(partition_id as usize),
+                            metrics.as_ref(),
+                        )?;
+                        rows.extend(
+                            batch[DIST_COL]
+                                .as_primitive::<Float32Type>()
+                                .values()
+                                .iter()
+                                .copied()
+                                .zip(
+                                    batch[ROW_ID]
+                                        .as_primitive::<UInt64Type>()
+                                        .values()
+                                        .iter()
+                                        .copied(),
+                                )
+                                .filter(|&(_, row_id)| mask.selected(row_id)),
+                        );
+                    }
+                    rows.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    rows.truncate(query.k);
+                    let (distances, row_ids): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+                    Ok(RecordBatch::try_new(
+                        KNN_INDEX_SCHEMA.clone(),
+                        vec![
+                            Arc::new(Float32Array::from(distances)),
+                            Arc::new(UInt64Array::from(row_ids)),
+                        ],
+                    )?)
+                })
+                .collect()
+        }
+
         #[allow(clippy::too_many_arguments)]
         async fn search_partitions(
             self: Arc<Self>,
@@ -3512,7 +3566,11 @@ mod tests {
         }
     }
 
-    async fn empty_prefilter() -> Arc<DatasetPreFilter> {
+    pub(super) async fn empty_prefilter() -> Arc<DatasetPreFilter> {
+        prefilter_with_mask(None).await
+    }
+
+    pub(super) async fn prefilter_with_mask(mask: Option<RowAddrMask>) -> Arc<DatasetPreFilter> {
         static NEXT_PREFILTER_DATASET_ID: AtomicUsize = AtomicUsize::new(0);
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -3554,7 +3612,11 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], None));
+        let mut prefilter = DatasetPreFilter::new(dataset, &[index], None);
+        if let Some(mask) = mask {
+            prefilter = prefilter.with_overlay_block(mask);
+        }
+        let prefilter = Arc::new(prefilter);
         prefilter.wait_for_ready().await.unwrap();
         prefilter
     }
@@ -3713,11 +3775,11 @@ mod tests {
         );
     }
 
-    fn prepared_metrics() -> Arc<AnnIndexMetrics> {
+    pub(super) fn prepared_metrics() -> Arc<AnnIndexMetrics> {
         Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
     }
 
-    type PreparedIndexState = (
+    pub(super) type PreparedIndexState = (
         Arc<dyn VectorIndex>,
         Arc<Mutex<Vec<usize>>>,
         Arc<Mutex<Vec<usize>>>,
@@ -3730,7 +3792,7 @@ mod tests {
     }
 
     /// One partition per entry, each returning the rows in that entry.
-    fn prepared_index_multi(row_ids: Vec<Vec<u64>>) -> PreparedIndexState {
+    pub(super) fn prepared_index_multi(row_ids: Vec<Vec<u64>>) -> PreparedIndexState {
         let prepared_partitions = Arc::new(Mutex::new(Vec::new()));
         let searched_partitions = Arc::new(Mutex::new(Vec::new()));
         let search_threads = Arc::new(Mutex::new(Vec::new()));
@@ -3741,6 +3803,7 @@ mod tests {
             searched_partitions: searched_partitions.clone(),
             search_threads: search_threads.clone(),
             row_ids,
+            batch_sizes: Arc::default(),
         });
         (
             index,
@@ -3821,6 +3884,7 @@ mod tests {
             searched_partitions: Arc::default(),
             search_threads: Arc::default(),
             row_ids: vec![vec![1], vec![2]],
+            batch_sizes: Arc::default(),
         };
         let mut called = false;
         let result = AutoProbePolicy::select_with_config(&query, &index, &vector_type, |_, _| {
