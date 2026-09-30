@@ -6403,24 +6403,14 @@ impl Scanner {
     ///
     /// Requires all of:
     /// - no refine step (the batch path does not yet rerank);
-    /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
+    /// - a positive `minimum_nprobes`;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
     ///   `fast_search`, which searches only the selected segments anyway).
     ///
-    /// The fixed-nprobes requirement is a *correctness* gate, not just an
-    /// optimization. The shared-scan path searches exactly `minimum_nprobes`
-    /// partitions per query, but the single-query path is adaptive: it applies a
-    /// k-dependent `early_pruning` floor and then expands probes up to
-    /// `maximum_nprobes` (late search) when a query has fewer than `k` results.
-    /// When `minimum_nprobes == maximum_nprobes` neither adjustment can fire
-    /// (pruning is capped at the maximum, and the late-search range is empty), so
-    /// the batch result is provably identical to repeated single-query search.
-    /// With adaptive nprobes the two would diverge, so we fall back to the
-    /// per-query loop, which reuses the real adaptive search and stays exact.
-    ///
-    /// Extending the shared-scan path to adaptive nprobes (a batched early/late
-    /// search) is left as a follow-up.
+    /// Both fixed and adaptive nprobes are supported: the batch node applies the
+    /// same initial probe budget and late-search expansion as the single-query
+    /// path, so each query probes the same partitions it would probe alone.
     async fn batch_index_search_supported(
         &self,
         index_name: &str,
@@ -6435,16 +6425,10 @@ impl Scanner {
         if q.refine_factor.is_some() {
             return Ok(false);
         }
-        // Only fixed nprobes is provably equivalent to single-query search; see
-        // the method docs. Adaptive nprobes falls back to the per-query loop.
-        if q.maximum_nprobes != Some(q.minimum_nprobes) {
-            return Ok(false);
-        }
-        // `nprobes(0)` is not rejected by the query builder, so `min == max == 0`
-        // slips past the fixed-nprobes check above. The single-query path probes
-        // nothing and returns an empty result, whereas the batch node would probe
-        // one partition's worth of neighbors — a silent divergence. Fall back so
-        // the per-query loop defines the semantics of `nprobes(0)`.
+        // `minimum_nprobes(0)` is not rejected by the query builder. The
+        // single-query path then probes nothing up front and leaves every probe
+        // to its late search; fall back so the per-query loop keeps defining
+        // those semantics rather than reproducing them in the batch node.
         if q.minimum_nprobes == 0 {
             return Ok(false);
         }
@@ -11446,13 +11430,10 @@ mod test {
         );
     }
 
-    /// Without pinned nprobes the shared-scan fast path is not equivalent to
-    /// single-query search (the single-query path applies an adaptive
-    /// `early_pruning` floor and late-search expansion that the batch path does
-    /// not), so the scanner must fall back to the per-query loop, which reuses
-    /// the real adaptive search and stays exact.
+    /// Adaptive nprobes (no `nprobes()` call) now uses the shared-scan batch node,
+    /// which applies the same probe budget as the single-query path.
     #[tokio::test]
-    async fn test_batch_knn_indexed_adaptive_nprobes_falls_back() {
+    async fn test_batch_knn_indexed_adaptive_nprobes() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
             .unwrap();
@@ -11468,22 +11449,268 @@ mod test {
 
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
-            !plan.contains("ANNIvfBatch"),
-            "adaptive nprobes must not use the shared-scan batch node, got:\n{}",
-            plan
-        );
-        assert!(
-            plan.contains("ANNSubIndex"),
-            "adaptive nprobes batch search should fall back to the per-query loop, got:\n{}",
-            plan
+            plan.contains("ANNIvfBatch"),
+            "adaptive nprobes should use the shared-scan batch node, got:\n{plan}"
         );
 
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
-        // The fallback runs real single-query searches, so it stays exact even
-        // with adaptive nprobes.
         assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, None)
             .await;
+    }
+
+    const ADAPTIVE_DIM: usize = 8;
+    const ADAPTIVE_QUERIES: usize = 6;
+
+    /// 2,000 random vectors over 4 fragments with a 16-partition index, enough
+    /// partitions for the adaptive budget and late search to diverge from a
+    /// fixed probe count. With `is_multi_delta`, 500 more rows are appended and
+    /// indexed as a second delta.
+    async fn adaptive_batch_dataset(index_type: &str, is_multi_delta: bool) -> Dataset {
+        let mut dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col(
+                "vec",
+                array::rand_vec::<Float32Type>(Dimension::from(ADAPTIVE_DIM as u32)),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(500))
+            .await
+            .unwrap();
+        let params = match index_type {
+            "IVF_FLAT" => VectorIndexParams::ivf_flat(16, MetricType::L2),
+            "IVF_PQ" => VectorIndexParams::ivf_pq(16, 8, 4, MetricType::L2, 10),
+            other => panic!("unsupported index type {other}"),
+        };
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        if is_multi_delta {
+            let extra = gen_batch()
+                .col("i", array::step_custom::<Int32Type>(2000, 1))
+                .col(
+                    "vec",
+                    array::rand_vec::<Float32Type>(Dimension::from(ADAPTIVE_DIM as u32)),
+                )
+                .into_reader_rows(RowCount::from(500), BatchCount::from(1));
+            dataset.append(extra, None).await.unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            assert!(dataset.load_indices_by_name("idx").await.unwrap().len() >= 2);
+        }
+        dataset
+    }
+
+    /// The first `ADAPTIVE_QUERIES` stored vectors, shifted slightly so each
+    /// query is near (but not exactly on) an indexed row.
+    async fn adaptive_batch_queries(dataset: &Dataset) -> Vec<f32> {
+        let batch = dataset
+            .scan()
+            .project(&["vec"])
+            .unwrap()
+            .limit(Some(ADAPTIVE_QUERIES as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        batch["vec"]
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .map(|v| v + 0.01)
+            .collect()
+    }
+
+    fn configure_adaptive_scan(
+        scan: &mut Scanner,
+        query: &dyn Array,
+        k: usize,
+        filter: Option<&str>,
+        maximum_nprobes: Option<usize>,
+        use_index: bool,
+    ) {
+        scan.nearest("vec", query, k).unwrap();
+        scan.use_index(use_index);
+        scan.minimum_nprobes(1);
+        if let Some(maximum) = maximum_nprobes {
+            scan.maximum_nprobes(maximum);
+        }
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+            scan.prefilter(true);
+        }
+        scan.project(&["i"]).unwrap();
+    }
+
+    fn rows_for_query(batch: &RecordBatch, query_index: usize) -> RecordBatch {
+        let mask = BooleanArray::from_iter(
+            batch[QUERY_INDEX_COL]
+                .as_primitive::<Int32Type>()
+                .iter()
+                .map(|value| value.map(|value| value == query_index as i32)),
+        );
+        arrow::compute::filter_record_batch(batch, &mask).unwrap()
+    }
+
+    /// Batch search with adaptive nprobes must return exactly what each query
+    /// returns on its own: same initial budget, same late-search stop point, and
+    /// the same "fewer than k rows match" shortcut.
+    #[rstest]
+    #[case::no_filter(None, None)]
+    #[case::late_search(Some("i % 97 = 0"), None)]
+    #[case::late_search_capped(Some("i % 97 = 0"), Some(3))]
+    #[case::fewer_than_k_match(Some("i < 5"), None)]
+    #[tokio::test]
+    async fn test_batch_knn_adaptive_nprobes_matches_single(
+        #[values("IVF_FLAT", "IVF_PQ")] index_type: &str,
+        #[case] filter: Option<&str>,
+        #[case] maximum_nprobes: Option<usize>,
+    ) {
+        let dataset = adaptive_batch_dataset(index_type, false).await;
+        let query_values = adaptive_batch_queries(&dataset).await;
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values.clone()),
+            ADAPTIVE_DIM as i32,
+        )
+        .unwrap();
+        let k = 10;
+
+        let mut scan = dataset.scan();
+        configure_adaptive_scan(&mut scan, &queries, k, filter, maximum_nprobes, true);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfBatch"),
+            "adaptive batch search should use the shared-scan node, got:\n{plan}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+
+        let mut hits = 0;
+        let mut expected_total = 0;
+        for query_index in 0..ADAPTIVE_QUERIES {
+            let query = Float32Array::from(
+                query_values[query_index * ADAPTIVE_DIM..(query_index + 1) * ADAPTIVE_DIM].to_vec(),
+            );
+            let mut single_scan = dataset.scan();
+            configure_adaptive_scan(&mut single_scan, &query, k, filter, maximum_nprobes, true);
+            let single = single_scan.try_into_batch().await.unwrap();
+            let batch_rows = rows_for_query(&batch, query_index);
+            assert_eq!(
+                batch_rows["i"].as_primitive::<Int32Type>().values(),
+                single["i"].as_primitive::<Int32Type>().values(),
+                "{index_type} query {query_index}: batch rows must match single-query rows"
+            );
+            assert_eq!(
+                batch_rows[DIST_COL].as_primitive::<Float32Type>().values(),
+                single[DIST_COL].as_primitive::<Float32Type>().values(),
+                "{index_type} query {query_index}: batch distances must match single-query"
+            );
+
+            let mut flat_scan = dataset.scan();
+            configure_adaptive_scan(&mut flat_scan, &query, k, filter, None, false);
+            let flat = flat_scan.try_into_batch().await.unwrap();
+            let expected: HashSet<i32> = flat["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            expected_total += expected.len();
+            hits += batch_rows["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .filter(|i| expected.contains(i))
+                .count();
+        }
+        // Capping maximum_nprobes limits recall by design; the equality above
+        // is what matters there.
+        if maximum_nprobes.is_none() {
+            let recall = hits as f32 / expected_total as f32;
+            assert!(recall >= 0.5, "{index_type} recall {recall} below 0.5");
+        }
+        if filter == Some("i < 5") {
+            // Only 5 rows can match, and the shortcut returns all of them.
+            assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * 5);
+        } else if maximum_nprobes.is_none() {
+            // Late search keeps probing until every query has k rows.
+            assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * k);
+        }
+    }
+
+    /// Across delta segments the late search shares each query's found count,
+    /// so every query still reaches k rows without duplicates.
+    #[rstest]
+    #[case::no_filter(None)]
+    #[case::late_search(Some("i % 97 = 0"))]
+    // Matches live only in the appended delta, so the late search must advance it
+    // alongside the first delta instead of exhausting the first delta beforehand.
+    #[case::late_search_newer_delta(Some("i >= 2000 AND i % 7 = 0"))]
+    #[tokio::test]
+    async fn test_batch_knn_adaptive_nprobes_multiple_deltas(#[case] filter: Option<&str>) {
+        let dataset = adaptive_batch_dataset("IVF_FLAT", true).await;
+        let query_values = adaptive_batch_queries(&dataset).await;
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values.clone()),
+            ADAPTIVE_DIM as i32,
+        )
+        .unwrap();
+        let k = 10;
+
+        let mut scan = dataset.scan();
+        configure_adaptive_scan(&mut scan, &queries, k, filter, None, true);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfBatch"), "got:\n{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * k);
+
+        let mut hits = 0;
+        for query_index in 0..ADAPTIVE_QUERIES {
+            let batch_rows = rows_for_query(&batch, query_index);
+            let ids: HashSet<i32> = batch_rows["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(ids.len(), k, "query {query_index} returned duplicate rows");
+
+            let query = Float32Array::from(
+                query_values[query_index * ADAPTIVE_DIM..(query_index + 1) * ADAPTIVE_DIM].to_vec(),
+            );
+            if filter == Some("i >= 2000 AND i % 7 = 0") {
+                // Only one delta can contribute rows, so the result is deterministic.
+                let mut single_scan = dataset.scan();
+                configure_adaptive_scan(&mut single_scan, &query, k, filter, None, true);
+                let single = single_scan.try_into_batch().await.unwrap();
+                assert_eq!(
+                    batch_rows["i"].as_primitive::<Int32Type>().values(),
+                    single["i"].as_primitive::<Int32Type>().values(),
+                    "query {query_index}: batch rows must match single-query rows"
+                );
+            }
+
+            let mut flat_scan = dataset.scan();
+            configure_adaptive_scan(&mut flat_scan, &query, k, filter, None, false);
+            let flat = flat_scan.try_into_batch().await.unwrap();
+            hits += flat["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .filter(|i| ids.contains(i))
+                .count();
+        }
+        let recall = hits as f32 / (ADAPTIVE_QUERIES * k) as f32;
+        assert!(recall >= 0.5, "recall {recall} below 0.5");
     }
 
     /// An in-place vector update (`update_columns` + `Operation::Update`) prunes the
@@ -11493,6 +11720,7 @@ mod test {
     /// each segment's ownership so the stale copy is neither returned nor counted.
     #[rstest]
     #[case::fixed_nprobes(Some(2))]
+    #[case::adaptive_nprobes(None)]
     #[tokio::test]
     async fn test_batch_knn_skips_rows_owned_by_newer_delta(
         #[case] nprobes: Option<usize>,
