@@ -288,9 +288,9 @@ impl LateSearchProgress {
 ///
 /// `candidates[i]` holds query `i`'s early-search rows from all deltas and is
 /// extended in place with its late-search rows (or the unseen prefilter rows at
-/// `+inf` distance when fewer than `k` rows can match). Every round advances all
-/// deltas together and they share each query's found count, so a query stops as
-/// soon as its budget is met.
+/// `+inf` distance when fewer than `k` rows can match). Rounds rotate across
+/// queries and deltas under a shared probe cap; deltas share each query's found
+/// count, so a query stops as soon as its budget is met.
 pub(super) async fn late_search(
     deltas: &[BatchDelta],
     dim: usize,
@@ -578,17 +578,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case::both_deltas(vec![10], vec![20], vec![10, 20])]
-    #[case::newer_delta_only(vec![], vec![20, 21], vec![20, 21])]
+    #[case::both_deltas(vec![10], vec![11], vec![20], vec![10, 20])]
+    #[case::newer_delta_only(vec![], vec![], vec![20, 21], vec![20, 21])]
     #[tokio::test]
     async fn test_late_search_advances_deltas_together(
         #[case] first_rows: Vec<u64>,
+        #[case] first_later_rows: Vec<u64>,
         #[case] second_rows: Vec<u64>,
         #[case] expected_rows: Vec<u64>,
     ) {
         let pre_filter = empty_prefilter().await;
-        let (first, first_searched) =
-            delta(vec![vec![], first_rows, vec![11]], 1, pre_filter.clone());
+        let (first, first_searched) = delta(
+            vec![vec![], first_rows, first_later_rows],
+            1,
+            pre_filter.clone(),
+        );
         let (second, second_searched) =
             delta(vec![vec![], second_rows, vec![22]], 1, pre_filter.clone());
         let mut candidates = vec![vec![]];
