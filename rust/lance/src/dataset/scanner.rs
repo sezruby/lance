@@ -6412,7 +6412,8 @@ impl Scanner {
     /// same initial probe budget and sequential late-search cut. Across deltas
     /// it consumes results round-robin, while single-query search follows their
     /// nondeterministic completion order. Explicit parallel adaptive probing
-    /// falls back because it can search beyond the sequential cut.
+    /// falls back because it can search beyond the sequential cut. Adaptive RQ
+    /// also falls back until its scalar and batch scoring paths agree.
     async fn batch_index_search_supported(
         &self,
         index_name: &str,
@@ -6453,10 +6454,10 @@ impl Scanner {
         // to call `supports_batch_partition_search()`: this is a planning-time
         // gate and the single-query path likewise avoids opening the index here.
         // An IVF index with a flat-style sub-index (i.e. not HNSW) is exactly the
-        // set for which `supports_batch_partition_search()` is true; the exec
-        // re-checks that trait as a defensive invariant. Legacy segments without
-        // details fall back.
-        let all_ivf_flat_style = index_segments.iter().all(|index| {
+        // set for which `supports_batch_partition_search()` is true; adaptive RQ
+        // compatibility further restricts eligibility below. The exec re-checks
+        // the trait as a defensive invariant. Legacy segments without details fall back.
+        let all_support_batch_search = index_segments.iter().all(|index| {
             index
                 .index_details
                 .as_ref()
@@ -6464,11 +6465,17 @@ impl Scanner {
                 .map(|details| {
                     let index_type =
                         crate::index::vector::details::derive_vector_index_type(details);
-                    index_type.starts_with("IVF_") && !index_type.contains("HNSW")
+                    // RQ's filtered batch accumulator can differ from scalar
+                    // single-query scoring. Preserve the per-query adaptive path.
+                    let is_adaptive_rq =
+                        index_type == "IVF_RQ" && q.maximum_nprobes != Some(q.minimum_nprobes);
+                    index_type.starts_with("IVF_")
+                        && !index_type.contains("HNSW")
+                        && !is_adaptive_rq
                 })
                 .unwrap_or(false)
         });
-        if !all_ivf_flat_style {
+        if !all_support_batch_search {
             return Ok(false);
         }
         // The batch node searches only the index's own entries; unlike the
@@ -11583,7 +11590,8 @@ mod test {
 
     /// Batch search with adaptive nprobes must return exactly what each query
     /// returns on its own: same initial budget, same late-search stop point, and
-    /// the same "fewer than k rows match" shortcut.
+    /// the same "fewer than k rows match" shortcut. RQ preserves this through
+    /// the per-query fallback until its batch scorer has matching semantics.
     #[rstest]
     #[case::no_filter(None, None)]
     #[case::late_search(Some("i % 97 = 0"), None)]
@@ -11609,9 +11617,10 @@ mod test {
         let mut scan = dataset.scan();
         configure_adaptive_scan(&mut scan, &queries, k, filter, maximum_nprobes, true);
         let plan = scan.explain_plan(false).await.unwrap();
-        assert!(
+        assert_eq!(
             plan.contains("ANNIvfBatch"),
-            "adaptive batch search should use the shared-scan node, got:\n{plan}"
+            index_type != "IVF_RQ",
+            "adaptive RQ must preserve the per-query path; other types share scans:\n{plan}"
         );
         let batch = scan.try_into_batch().await.unwrap();
 
@@ -11667,6 +11676,26 @@ mod test {
         } else if maximum_nprobes.is_none() {
             // Late search keeps probing until every query has k rows.
             assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * k);
+        }
+        if index_type == "IVF_RQ" {
+            let mut fixed_scan = dataset.scan();
+            configure_adaptive_scan(&mut fixed_scan, &queries, k, filter, None, true);
+            fixed_scan.nprobes(16);
+            assert!(
+                fixed_scan
+                    .explain_plan(false)
+                    .await
+                    .unwrap()
+                    .contains("ANNIvfBatch"),
+                "fixed-probe RQ must retain its existing shared-scan path"
+            );
+            let fixed = fixed_scan.try_into_batch().await.unwrap();
+            let rows_per_query = match filter {
+                Some("i < 0") => 0,
+                Some("i < 5") => 5,
+                _ => k,
+            };
+            assert_eq!(fixed.num_rows(), ADAPTIVE_QUERIES * rows_per_query);
         }
     }
 
