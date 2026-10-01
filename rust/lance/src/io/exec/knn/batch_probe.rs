@@ -83,6 +83,14 @@ pub(super) struct BatchDelta {
 }
 
 impl BatchDelta {
+    /// Release unused rankings between early scans instead of retaining them
+    /// across every delta until the early-search barrier.
+    pub(super) fn retain_for_late_search(self, deltas: &mut Vec<Self>) {
+        if (0..self.plans.len()).any(|query_index| self.joins_late_search(query_index)) {
+            deltas.push(self);
+        }
+    }
+
     /// Whether this delta joins query `query_index`'s late search. Like the
     /// single-query path, a segment whose fragments all moved to newer deltas can
     /// produce no row, so it is skipped rather than probed to `maximum_nprobes`.
@@ -506,6 +514,46 @@ mod tests {
         )
     }
 
+    #[rstest]
+    #[case::fixed(false, false)]
+    #[case::adaptive(true, false)]
+    #[case::empty_ownership(true, true)]
+    #[tokio::test]
+    async fn test_early_delta_retention_releases_unused_state(
+        #[case] has_late_range: bool,
+        #[case] empty_ownership: bool,
+    ) {
+        let pre_filter = empty_prefilter().await;
+        let mut retained = Vec::new();
+        let should_retain = has_late_range && !empty_ownership;
+        for delta_index in 0..6 {
+            let (mut delta, _) = delta(vec![vec![]; 3], 2, pre_filter.clone());
+            for plan in &mut delta.plans {
+                plan.late_end = plan.early_end;
+            }
+            if has_late_range {
+                delta.plans[1].late_end = 3;
+            }
+            if empty_ownership {
+                delta.seg_mask = Some(Arc::new(RowAddrMask::allow_nothing()));
+            }
+            let index = Arc::downgrade(&delta.index);
+            let keys = Arc::downgrade(&delta.query.key);
+            let partitions = Arc::downgrade(&delta.plans[0].partitions);
+            let distances = Arc::downgrade(&delta.plans[0].q_c_dists);
+            delta.retain_for_late_search(&mut retained);
+            assert_eq!(index.upgrade().is_some(), should_retain);
+            assert_eq!(keys.upgrade().is_some(), should_retain);
+            assert_eq!(partitions.upgrade().is_some(), should_retain);
+            assert_eq!(distances.upgrade().is_some(), should_retain);
+            assert_eq!(
+                retained.len(),
+                if should_retain { delta_index + 1 } else { 0 },
+                "fixed-probe rankings must be released before opening the next delta"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_late_search_enforces_probe_limit() {
         let pre_filter = empty_prefilter().await;
@@ -536,6 +584,50 @@ mod tests {
             "every late-search round must obey its probe limit: {sizes:?}"
         );
         assert!(candidates.iter().all(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn test_late_search_caps_combined_delta_admission() {
+        const DELTA_COUNT: usize = 3;
+        let pre_filter = empty_prefilter().await;
+        let limit = MAX_LATE_PROBES_PER_ROUND.max(get_num_compute_intensive_cpus());
+        let query_count = limit / DELTA_COUNT + 1;
+        let mut deltas = Vec::with_capacity(DELTA_COUNT);
+        let mut batch_sizes = Vec::with_capacity(DELTA_COUNT);
+        for _ in 0..DELTA_COUNT {
+            let (delta, _) = delta(vec![vec![], vec![10]], query_count, pre_filter.clone());
+            batch_sizes.push(
+                delta
+                    .index
+                    .as_any()
+                    .downcast_ref::<PreparedThreadCapturingIndex>()
+                    .unwrap()
+                    .batch_sizes
+                    .clone(),
+            );
+            deltas.push(delta);
+        }
+        let mut candidates = vec![vec![]; query_count];
+        late_search(
+            &deltas,
+            1,
+            1,
+            pre_filter,
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        let combined_probes: usize = batch_sizes
+            .iter()
+            .map(|sizes| {
+                let sizes = sizes.lock().unwrap();
+                assert_eq!(sizes.len(), 1, "every query must finish in the first round");
+                sizes[0]
+            })
+            .sum();
+        assert_eq!(combined_probes, limit);
+        assert!(candidates.iter().all(|rows| rows.len() == 1));
     }
 
     #[rstest]

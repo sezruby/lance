@@ -2745,13 +2745,14 @@ impl ExecutionPlan for ANNIvfBatchExec {
                 for (query_index, batch) in per_query.iter().enumerate() {
                     batch_probe::append_candidates(batch, &mut candidates[query_index])?;
                 }
-                deltas.push(batch_probe::BatchDelta {
+                batch_probe::BatchDelta {
                     index,
                     query: normalized,
                     plans,
                     pre_filter: segment_pre_filter,
                     seg_mask,
-                });
+                }
+                .retain_for_late_search(&mut deltas);
             }
             batch_probe::late_search(
                 &deltas,
